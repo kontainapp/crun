@@ -25,8 +25,11 @@
 #include <errno.h>
 
 #include "crun.h"
+#include "kontain.h"
+#include "debug.h"
 #include "libcrun/container.h"
 #include "libcrun/utils.h"
+#include "libcrun/status.h"
 
 enum
 {
@@ -163,6 +166,15 @@ crun_command_create (struct crun_global_arguments *global_args, int argc, char *
     libcrun_fail_with_error (0, "error loading config.json");
 
   crun_context.bundle = bundle;
+
+  if (crun_context.kontain) {
+    ret = add_kontain_config(container);
+    if (ret < 0) {
+      libcrun_fail_with_error(0, "adding kontain bind mounts");
+      return ret;
+    }
+  }
+
   if (getenv ("LISTEN_FDS"))
     crun_context.preserve_fds += strtoll (getenv ("LISTEN_FDS"), NULL, 10);
 

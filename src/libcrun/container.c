@@ -42,6 +42,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <grp.h>
+#include "kontain.h"
 
 #ifdef HAVE_DLOPEN
 #  include <dlfcn.h>
@@ -1191,6 +1192,12 @@ container_init_setup (void *args, pid_t own_pid, char *notify_socket, int sync_s
 
           return crun_make_error (err, errno, "open executable");
         }
+      if (entrypoint_args->context->kontain) {
+        int rc = libcrun_kontain_argv(&def->process->args, exec_path);
+        if (rc != 0) {
+          return crun_make_error (err, rc, "init: fixup argv");
+        }
+      }
     }
 
   ret = setsid ();
@@ -3177,6 +3184,13 @@ libcrun_container_exec (libcrun_context_t *context, const char *id, runtime_spec
 
           libcrun_fail_with_error ((*err)->status, "%s", (*err)->msg);
         }
+
+      if (context->kontain) {
+        int rc = libcrun_kontain_argv(&process->args, &exec_path);
+        if (rc != 0) {
+          libcrun_fail_with_error (rc, "exec: fixup argv");
+        }
+      }
 
       if (container->container_def->linux && container->container_def->linux->personality)
         {
