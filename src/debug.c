@@ -47,7 +47,7 @@ dumpmounts(libcrun_container_t *container)
    debug_open_tracefile();
 
    for (i = 0; i < container_def->mounts_len; i++) {
-      fprintf(tracefile, "mount[%d]: source %s, destination %s, type %s, options_len %d\n",
+      fprintf(tracefile, "mount[%d]: source %s, destination %s, type %s, options_len %lu\n",
          i, container_def->mounts[i]->source, container_def->mounts[i]->destination,
          container_def->mounts[i]->type, container_def->mounts[i]->options_len);
       for (int j = 0; j < container_def->mounts[i]->options_len; j++) {
@@ -69,8 +69,8 @@ dumpdevices(libcrun_container_t *container)
                      "file_mode 0%o, file_mode_present %u, "
                      "major %ld, major_present %u, "
                      "minor %ld, minor_present %u, "
-                     "uid %ld, uid_present %u, "
-                     "gid %ld, gid_present %u\n",
+                     "uid %u, uid_present %u, "
+                     "gid %u, gid_present %u\n",
          i,
          container_def->linux->devices[i]->type,
          container_def->linux->devices[i]->path,
