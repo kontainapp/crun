@@ -68,3 +68,4 @@ tests/tests_libcrun_errors
 tests/tests_libcrun_utils
 tests/*.log
 tests/*.trs
+test-suite.log
