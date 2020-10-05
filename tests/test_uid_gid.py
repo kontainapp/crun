@@ -69,7 +69,7 @@ def test_gid():
     conf = base_config()
     conf['process']['args'] = ['/init', 'cat', '/proc/self/status']
     add_all_namespaces(conf)
-    conf['process']['user']['gid'] = 1000
+    conf['process']['user']['gid'] = 165537
     out, _ = run_and_get_output(conf)
     proc_status = parse_proc_status(out)
 
