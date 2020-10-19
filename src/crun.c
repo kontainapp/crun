@@ -296,12 +296,6 @@ main (int argc, char **argv)
   libcrun_error_t err = NULL;
   int ret, first_argument;
 
-FILE *tf = fopen("/tmp/kontain_crun_trace.out", "a");
-for (int i = 0; i < argc; i++) {
-  fprintf(tf, "argv[%d] = %s\n", i, argv[i]);
-}
-fclose(tf);
-
   char *cmd = strrchr(argv[0], '/');
   if (cmd == NULL) {
     cmd = argv[0];
@@ -315,7 +309,6 @@ fclose(tf);
   argp_program_version_hook = print_version;
 
   argp_parse (&argp, argc, argv, ARGP_IN_ORDER, &first_argument, &arguments);
-debug("argv[0] %s, command %s, arguments.kontain %d\n", argv[0], argv[first_argument], arguments.kontain);
 
   command = get_command (argv[first_argument]);
   if (command == NULL)
