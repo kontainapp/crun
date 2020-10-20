@@ -50,39 +50,17 @@ int libcrun_kontain_argv(char ***argv, const char **execpath)
    char **newargv;
    const char *cmd = *execpath;
 
-FILE *tf = fopen("/tmp/kontain_crun_trace.out", "a");
-fprintf(tf, "%s: argv %p, execpath %p\n", __FUNCTION__, argv, execpath);
-fflush(tf);
-fprintf(tf, "execpath %p, %s\n", execpath, *execpath);
-fflush(tf);
-#if 1
-for (int i = 0; (*argv)[i] != NULL; i++) {
-  fprintf(tf, "argv[%d] = %s\n", i, (*argv)[i]);
-  fflush(tf);
-}
-#endif
-fprintf(tf, "done looking at argv[]\n");
-fflush(tf);
-
-fprintf(tf, "cmd %s\n", cmd);
-fflush(tf);
    if (cmd[0] != '/') {  // verify that we are getting an absolute path
       return EINVAL;
    }
    if (fstatat(AT_FDCWD, cmd, &statb, AT_SYMLINK_NOFOLLOW) != 0) {
       // the command does not exist?  Let the caller handle that.
-fprintf(tf, "stat(cmd) failed, errno %d\n", errno);
-fflush(tf);
       return errno;
    }
-fprintf(tf, "%s: st_mode 0%o\n", cmd, statb.st_mode);
-fflush(tf);
    if ((statb.st_mode & S_IFMT) == S_IFLNK) {
       char linkcontents[PATH_MAX];
       while ((statb.st_mode & S_IFMT) == S_IFLNK) {
          int rc = readlink(cmd, linkcontents, sizeof(linkcontents));
-fprintf(tf, "readlink %s returned %d\n", cmd, rc);
-fflush(tf);
          if (rc < 0) {
             return errno;
          }
@@ -104,7 +82,7 @@ fflush(tf);
 
    /* Some program other than km, assume they need km to run it so insert the path to km into argv[] */
    int argc;
-   for (argc = 0; argv[argc] != NULL; argc++);
+   for (argc = 0; (*argv)[argc] != NULL; argc++);
    argc++;  // for null array terminator
 
    // grow argv[]
@@ -116,12 +94,12 @@ fflush(tf);
    // Set km to the program that is to be run, it will run the former argv[0]
    newargv[0] = strdup(KM_BIN_PATH);
    for (int i = 0; i <= argc; i++) {
-      newargv[i + 1] = *argv[i];
+      newargv[i + 1] = (*argv)[i];
    }
 
    // replace the payload filename and set the execpath to km's path
    free(newargv[1]);
-   newargv[1] = (char *)*execpath;
+   newargv[1] = (char *)strdup(*execpath);
    *execpath = strdup(KM_BIN_PATH);
 
    // Give the caller the new argv[]
@@ -129,6 +107,5 @@ fflush(tf);
    *argv = newargv;
    free(oldargv);
 
-fprintf(tf, "%s: done\n", __FUNCTION__);
    return 0;
 }
