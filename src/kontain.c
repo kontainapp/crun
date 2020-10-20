@@ -170,6 +170,14 @@ add_kontain_devices(libcrun_container_t *container, const char *use_virt)
     return ret;
   }
 
+  // No resources, make an empty one of those first
+  if (linux->resources == NULL) {
+    linux->resources = calloc(1, sizeof(*linux->resources));
+    if (linux->resources == NULL) {
+      return ENOMEM;
+    }
+  }
+
   // Grow devices array
   size_t new_devices_len = linux->devices_len + 1;
   runtime_spec_schema_defs_linux_device **new_devices = realloc(linux->devices, new_devices_len * sizeof(runtime_spec_schema_defs_linux_device **));
