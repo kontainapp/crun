@@ -178,7 +178,7 @@ def run_all_tests(all_tests, allowed_tests):
                 print("not ok %d - %s" % (cur, k))
         except Exception as e:
             if hasattr(e, 'output'):
-                sys.stderr.write(str(e.output) + "\n")
+                sys.stderr.write(e.output.decode('UTF-8'))
             sys.stderr.write(str(e) + "\n")
             ret = -1
             print("not ok %d - %s" % (cur, k))
@@ -205,7 +205,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
 
     rootfs = os.path.join(temp_dir, "rootfs")
     os.makedirs(rootfs)
-    for i in ["usr/bin", "etc", "var", "lib", "lib64", "usr/share/zoneinfo/Europe", "proc", "sys", "dev"]:
+    for i in ["usr/bin", "sbin", "etc", "var", "lib", "lib64", "usr/share/zoneinfo/Europe"]:
         os.makedirs(os.path.join(rootfs, i))
     with open(os.path.join(rootfs, "var", "file"), "w+") as f:
         f.write("file")
@@ -223,11 +223,18 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
         config_file.write(conf)
 
     init = os.getenv("INIT") or "tests/init"
-    crun = get_crun_path()
-
-    os.makedirs(os.path.join(rootfs, "sbin"))
     shutil.copy2(init, os.path.join(rootfs, "init"))
     shutil.copy2(init, os.path.join(rootfs, "sbin", "init"))
+
+    crun = get_crun_path()
+    # If crun/krun creates these bind mount points they can't be removed for some of the tests.
+    head, tail = os.path.split(crun)
+    if tail == 'krun':
+        for i in ["opt/kontain/bin/km", "opt/kontain/runtime/libc.so"]:
+            dir, file = os.path.split(i)
+            os.makedirs(os.path.join(rootfs, dir))
+            f = open(os.path.join(rootfs, i), "w")
+            f.close()
 
     open(os.path.join(rootfs, "usr/share/zoneinfo/Europe/Rome"), "w").close()
     os.symlink("../usr/share/zoneinfo/Europe/Rome", os.path.join(rootfs, "etc/localtime"))
