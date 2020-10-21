@@ -169,7 +169,7 @@ crun_command_create (struct crun_global_arguments *global_args, int argc, char *
 
   if (crun_context.kontain) {
     ret = add_kontain_config(container);
-    if (ret < 0) {
+    if (ret != 0) {
       libcrun_fail_with_error(0, "adding kontain bind mounts");
       return ret;
     }
