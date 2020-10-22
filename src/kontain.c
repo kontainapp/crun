@@ -56,14 +56,21 @@ add_kontain_bind_mounts(libcrun_container_t *container, const char *privileged)
   runtime_spec_schema_config_schema *container_def = container->container_def;
   runtime_spec_schema_defs_mount **mounts = container_def->mounts;
   int mounts_len = container_def->mounts_len;
-  int kvmkkm_bind_mount = 0;
+  int need_kvm = 0;
+  int need_kkm = 0;
 
   // for unprivileged podman we bind mount /dev/kvm or /dev/kkm
   if (privileged != NULL && strcasecmp(privileged, "false") == 0) {
-    kvmkkm_bind_mount = 1;
+    struct stat statb;
+    if (stat("/dev/kvm", &statb) == 0) {
+      need_kvm = 1;
+    }
+    if (stat("/dev/kkm", &statb) == 0) {
+      need_kkm = 1;
+    }
   }
 
-  int new_mounts_len = mounts_len + 2 + kvmkkm_bind_mount;
+  int new_mounts_len = mounts_len + 2 + need_kvm + need_kkm;
   runtime_spec_schema_defs_mount **new_mounts = realloc(mounts, new_mounts_len * sizeof(runtime_spec_schema_defs_mount *));
   if (new_mounts == NULL) {
     return ENOMEM;
@@ -75,10 +82,19 @@ add_kontain_bind_mounts(libcrun_container_t *container, const char *privileged)
   container_def->mounts[mounts_len + 1] = build_kontain_bind_mount("/opt/kontain/runtime/libc.so", "/opt/kontain/runtime/libc.so");
   if (container_def->mounts[mounts_len + 1] == NULL)
     return ENOMEM;
-  if (kvmkkm_bind_mount != 0) {
-    container_def->mounts[mounts_len + 2] = build_kontain_bind_mount("/dev/kvm", "/dev/kvm");
-    if (container_def->mounts[mounts_len + 2] == NULL)
+
+  int offset = 0;
+  if (need_kvm != 0) {
+    container_def->mounts[mounts_len + 2 + offset] = build_kontain_bind_mount("/dev/kvm", "/dev/kvm");
+    if (container_def->mounts[mounts_len + 2 + offset] == NULL)
       return ENOMEM;
+    offset++;
+  }
+  if (need_kkm != 0) {
+    container_def->mounts[mounts_len + 2 + offset] = build_kontain_bind_mount("/dev/kkm", "/dev/kkm");
+    if (container_def->mounts[mounts_len + 2 + offset] == NULL)
+      return ENOMEM;
+    offset++;
   }
   container_def->mounts_len = new_mounts_len;
 
@@ -86,7 +102,7 @@ add_kontain_bind_mounts(libcrun_container_t *container, const char *privileged)
 }
 
 int
-build_kontain_device(char *devpath,
+build_kontain_device(const char *devpath,
    runtime_spec_schema_defs_linux_device **devp,
    runtime_spec_schema_defs_linux_device_cgroup **accessp)
 {
@@ -153,7 +169,7 @@ build_kontain_device(char *devpath,
 }
 
 int
-add_kontain_devices(libcrun_container_t *container, const char *use_virt)
+add_kontain_device(libcrun_container_t *container, const char *device)
 {
   runtime_spec_schema_config_schema *container_def = container->container_def;
   runtime_spec_schema_config_linux *linux = container_def->linux;
@@ -161,11 +177,7 @@ add_kontain_devices(libcrun_container_t *container, const char *use_virt)
   runtime_spec_schema_defs_linux_device_cgroup *access;
   int ret = ENODEV;
 
-  if (strcmp(use_virt, "kvm") == 0) {
-    ret = build_kontain_device("/dev/kvm", &dev, &access);
-  } else if (strcmp(use_virt, "kkm") == 0) {
-    ret = build_kontain_device("/dev/kkm", &dev, &access);
-  }
+  ret = build_kontain_device(device, &dev, &access);
   if (ret != 0) {
     return ret;
   }
@@ -202,15 +214,28 @@ add_kontain_devices(libcrun_container_t *container, const char *use_virt)
 }
 
 int
+add_kontain_devices(libcrun_container_t *container)
+{
+  int ret = 0;
+  struct stat statb;
+
+  if (stat("/dev/kvm", &statb) == 0) {
+    ret = add_kontain_device(container, "/dev/kvm");
+    if (ret != 0)
+      return ret;
+  }
+  if (stat("/dev/kkm", &statb) == 0) {
+    ret = add_kontain_device(container, "/dev/kkm");
+    if (ret != 0)
+      return ret;
+  }
+  return 0;
+}
+
+int
 add_kontain_config(libcrun_container_t *container)
 {
   int ret;
-  const char *use_virt = find_annotation(container, APP_KONTAIN_USEVIRT);
-  if (use_virt == NULL) {
-    libcrun_warning("Couldn't find %s annotation, using kvm", APP_KONTAIN_USEVIRT);
-    use_virt = "kvm";
-  }
-
   const char *privileged = find_annotation(container, "io.podman.annotations.privileged");
 
   ret = add_kontain_bind_mounts(container, privileged);
@@ -218,9 +243,9 @@ add_kontain_config(libcrun_container_t *container)
     return ret;
   }
 
-  // For docker or privileged podman, we create the /dev/kvm or kkm device.
+  // For docker or privileged podman, we create the /dev/kvm and/or kkm device.
   if (privileged == NULL || strcasecmp(privileged, "true") == 0) {
-    ret = add_kontain_devices(container, use_virt);
+    ret = add_kontain_devices(container);
   }
   return ret;
 }
