@@ -134,11 +134,8 @@ sha256_file(char* file, char *returned_hash)
       return errno;
    }
    sha256_final(&ctx, final_hash);
-
    close(f);
-
    hash_2_ascii(final_hash, returned_hash);
-
    return 0;
 }
 
@@ -186,9 +183,7 @@ kontain_execpath_builddb(execpath_state_t* statep)
    execpath_entry_t* tail = NULL;
    int rc = 0;
 
-   if (statep->execpath_dbpath != NULL) {
-      kontain_execpath_freedb(statep);
-   }
+   kontain_execpath_freedb(statep);
    f = fopen(statep->execpath_dbpath, "r");
    if (f == NULL) {
       libcrun_fail_with_error(errno, "Couldn't open %s", statep->execpath_dbpath);
@@ -247,6 +242,7 @@ kontain_execpath_builddb(execpath_state_t* statep)
       }
 
       // Chain entry on to the end of the list
+      libcrun_warning("Adding nonkm path: %s, %s, %s", fields[0], fields[1], fields[2]);
       if (tail == NULL) {
          SLIST_INSERT_HEAD(&statep->execpath_head, epp, link);
       } else {
