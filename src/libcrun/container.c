@@ -2513,7 +2513,7 @@ libcrun_container_exec (libcrun_context_t *context, const char *id, runtime_spec
           // Run as a payload
           rc = libcrun_kontain_argv(&process->args, &exec_path);
           if (rc != 0) {
-            libcrun_fail_with_error (rc, "exec: fixup argv");
+            libcrun_fail_with_error (rc, "failed to setup %s to run in a kontain VM", exec_path);
           }
         } else {
           // Run the returned path without km.

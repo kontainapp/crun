@@ -32,13 +32,12 @@
 #include "sha256.h"
 
 /*
- * What is going on in here?
- * We need to allow non kontain programs to be run inside of a kontain container.
- * But, we don't want arbitrary programs to be run.  So, we have a list of acceptable
+ * SOmetimes we need to allow programs to be run outside of kontain's vm encapsulation.
+ * But, we don't want arbitrary programs to be run this way.  So, we have a list of acceptable
  * programs that "docker exec ...." should be able to run.  This list is stored in
  * file (see KONTAIN_KRUN_CONFIG definition below).  When it is time to do the
- * exec() system call we parse the file, check to see if the program we are execing
- * too is allowed to run without km.  If it is allowed we exec the program directly.
+ * exec() system call we parse the config file, check to see if the program we are execing
+ * is allowed to run without vm encapsulation.  If it is allowed we exec the program directly.
  * If not, the program will need to run within a km virtual machine.
  * This blob of code is just used to see if a program should be allowed to run without
  * km containment.  The caller of libcrun_kontain_nonkmexec_allowed() uses the returned
@@ -165,9 +164,12 @@ split_into_fields(char* dbentry, char *fields[])
  * Entries in the file are a single line with fields separated by colons.
  * There are 3 fields:
  *   regular expression to match an input string against
- *   the file to exec to if the re matches
- *   a sha of the file being exec'ed to to verify the file is unchanged since the
+ *   the file to exec to if the regular expression matches
+ *   the sha of the file being exec'ed to to verify the file is unchanged since the
  *   db was created.
+ * Example of a line in the file:
+ *   /bin/ping|/usr/bin/ping:/bin/ping:XXXXXX
+ * Where XXXXXX is the sha256 of the file /bin/ping.
  * Failures is this function cause the process to exit.
  *
  * We should probably use some sort of json representation for this instead of the
