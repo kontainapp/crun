@@ -36,11 +36,11 @@
  * We need to allow non kontain programs to be run inside of a kontain container.
  * But, we don't want arbitrary programs to be run.  So, we have a list of acceptable
  * programs that "docker exec ...." should be able to run.  This list is stored in
- * file (see KONTAIN_OK_EXEC_TARGETS definition below).  When it is time to do the
+ * file (see KONTAIN_KRUN_CONFIG definition below).  When it is time to do the
  * exec() system call we parse the file, check to see if the program we are execing
  * too is allowed to run without km.  If it is allowed we exec the program directly.
  * If not, the program will need to run within a km virtual machine.
- * This blob of code is just use to see if a program should be allowed to run without
+ * This blob of code is just used to see if a program should be allowed to run without
  * km containment.  The caller of libcrun_kontain_nonkmexec_allowed() uses the returned
  * information to form the appropriate exec arguments.
  */
@@ -64,12 +64,12 @@ struct execpath_state {
 };
 typedef struct execpath_state execpath_state_t;
 
-#define KONTAIN_OK_EXEC_TARGETS	"/var/lib/krun/nonkm_exec_ok_config"
+#define KONTAIN_KRUN_CONFIG	"/var/lib/krun/config"
 
 execpath_state_t execpath_state = {
    PTHREAD_MUTEX_INITIALIZER,
    SLIST_HEAD_INITIALIZER(&execpath_state.execpath_head),
-   KONTAIN_OK_EXEC_TARGETS,
+   KONTAIN_KRUN_CONFIG,
    { 0, 0 }
 };
 
@@ -194,7 +194,7 @@ kontain_execpath_builddb(execpath_state_t* statep)
          // a really long line.
          rc = E2BIG;
          buf[sizeof(buf)-1] = 0;
-         libcrun_fail_with_error(rc, "execpath db line too long: %s", buf);
+         libcrun_fail_with_error(rc, "line: %s in %s is too long: %s", buf, statep->execpath_dbpath);
       }
       if (buf[0] == '#') {  // ignore comments
          continue;
@@ -270,13 +270,9 @@ kontain_execpath_lookup(execpath_state_t* statep, const char* execpath, execpath
    int rc;
    struct stat statb;
 
-   if (statep->execpath_dbpath == NULL) {
-      *eppp = NULL;
-      return 0;
-   }
    if (stat(statep->execpath_dbpath, &statb) != 0) {
       if (errno != ENOENT) {
-         libcrun_fail_with_error(errno, "can't access allowed nonkm executable list %s", statep->execpath_dbpath);
+         libcrun_warning("%s: can't access %s, error %s", __FUNCTION__, statep->execpath_dbpath, strerror(errno));
          return errno;
       }
       // No allowed executable file, so no executable is allowed to run without km
@@ -305,7 +301,11 @@ kontain_execpath_lookup(execpath_state_t* statep, const char* execpath, execpath
  * entry is found, take the path that should be used from the entry, then verify
  * that the executable is the one we expect, and finally return that path to the
  * caller.
- * If the passed executable can't be run without km, return NULL.
+ * Returns:
+ *   0 - the check succeeded, the value returned in execpath_allowed is valid.
+ *   != 0 - the check failed, the value returned in execpath_allowed is meaningless.
+ * execpath_allowed - returns the path the caller can exec to.  If the returned
+ *   pointer is null, they can't exec directly to the path passed in execpath.
  */
 int
 libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed)

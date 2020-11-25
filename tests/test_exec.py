@@ -65,7 +65,7 @@ def test_exec_not_exists():
 def test_exec_detach_not_exists():
     return test_exec_not_exists_helper(False)
 
-NONKM_OK_CONF = "var/lib/krun/nonkm_exec_ok_config"
+NONKM_OK_CONF = "var/lib/krun/config"
 
 def test_exec_non_km_payload_helper(execpath, nonkmok):
     """
