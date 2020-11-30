@@ -3186,9 +3186,21 @@ libcrun_container_exec (libcrun_context_t *context, const char *id, runtime_spec
         }
 
       if (context->kontain) {
-        int rc = libcrun_kontain_argv(&process->args, &exec_path);
+        char* new_execpath;
+        int rc = libcrun_kontain_nonkmexec_allowed(exec_path, &new_execpath);
         if (rc != 0) {
-          libcrun_fail_with_error (rc, "exec: fixup argv");
+          libcrun_fail_with_error(rc, "allow non-km executable check failed");
+        }
+        if (new_execpath == NULL) {
+          // Run as a payload
+          rc = libcrun_kontain_argv(&process->args, &exec_path);
+          if (rc != 0) {
+            libcrun_fail_with_error (rc, "failed to setup %s to run in a kontain VM", exec_path);
+          }
+        } else {
+          // Run the returned path without km.
+          free((char*)exec_path);
+          exec_path = new_execpath;
         }
       }
 
