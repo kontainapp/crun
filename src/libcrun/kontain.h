@@ -20,5 +20,7 @@
 
 #define KM_BIN_PATH "/opt/kontain/bin/km"
 int libcrun_kontain_argv(char ***argv, const char **execpath);
+int libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed);
+void libcrun_kontain_nonkmexec_clean(void);
 
 #endif

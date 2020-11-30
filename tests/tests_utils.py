@@ -193,7 +193,7 @@ def get_crun_path():
 def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
                        command='run', env=None, use_popen=False, hide_stderr=False,
                        all_dev_null=False, id_container=None, relative_config_path="config.json",
-                       chown_rootfs_to=None):
+                       chown_rootfs_to=None, copy_file_in=None):
 
     # Some tests require that the container user, which might not be the
     # same user as the person running the tests, is able to resolve the full path
@@ -235,6 +235,14 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
             os.makedirs(os.path.join(rootfs, dir))
             f = open(os.path.join(rootfs, i), "w")
             f.close()
+
+    # Let the test add a file into the container. copy_file_in is a 2 item list,
+    # item 0 - container relative path of the file, and
+    # item 1 - the non-container path of the file to copy in.
+    if copy_file_in is not None:
+        dir, file = os.path.split(copy_file_in[0])
+        os.makedirs(os.path.join(rootfs, dir))
+        shutil.copy2(copy_file_in[1], os.path.join(rootfs, copy_file_in[0]))
 
     open(os.path.join(rootfs, "usr/share/zoneinfo/Europe/Rome"), "w").close()
     os.symlink("../usr/share/zoneinfo/Europe/Rome", os.path.join(rootfs, "etc/localtime"))
