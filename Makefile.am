@@ -35,8 +35,7 @@ libcrun_SOURCES = src/libcrun/utils.c \
 			src/libcrun/signals.c \
 			src/libcrun/seccomp_notify.c \
 			src/libcrun/kontain.c \
-			src/libcrun/kontain_nonkmexec.c \
-			src/libcrun/sha256.c
+			src/libcrun/kontain_nonkmexec.c
 
 
 libcrun_la_SOURCES = $(libcrun_SOURCES)

@@ -1,7 +1,7 @@
 /*
  * crun - OCI runtime written in C
  *
- * Copyright (C) 2020 Kontain Inc.
+ * Copyright (C) 2020-2021 Kontain Inc.
  * crun is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
  * the Free Software Foundation; either version 2.1 of the License, or
@@ -29,10 +29,10 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "utils.h"
-#include "sha256.h"
+#include <openssl/evp.h>
 
 /*
- * SOmetimes we need to allow programs to be run outside of kontain's vm encapsulation.
+ * Sometimes we need to allow programs to be run outside of kontain's vm encapsulation.
  * But, we don't want arbitrary programs to be run this way.  So, we have a list of acceptable
  * programs that "docker exec ...." should be able to run.  This list is stored in
  * file (see KONTAIN_KRUN_CONFIG definition below).  When it is time to do the
@@ -48,7 +48,7 @@ struct execpath_entry {
    SLIST_ENTRY(execpath_entry) link;
    regex_t re;
    char* path;
-   char sha256[SHA256_BLOCK_SIZE * 2 + 1];
+   char sha256[EVP_MAX_MD_SIZE * 2 + 1];
 };
 typedef struct execpath_entry execpath_entry_t;
 
@@ -95,10 +95,10 @@ libcrun_kontain_nonkmexec_clean(void)
 }
 
 static void
-hash_2_ascii(BYTE hash[SHA256_BLOCK_SIZE], char *ascii)
+hash_2_ascii(unsigned char hash[EVP_MAX_MD_SIZE], unsigned int hash_len, char *ascii)
 {
    int i;
-   for (i = 0; i < SHA256_BLOCK_SIZE; i++) {
+   for (i = 0; i < hash_len; i++) {
       snprintf(&ascii[i * 2], 3, "%02x", hash[i]);
    }
    ascii[i * 2] = 0;
@@ -116,8 +116,9 @@ sha256_file(char* file, char *returned_hash)
 {
    int f;
    unsigned char filebuf[128*1024];
-   SHA256_CTX ctx;
-   BYTE final_hash[SHA256_BLOCK_SIZE];
+   EVP_MD_CTX* ctx;
+   unsigned char final_hash[EVP_MAX_MD_SIZE];
+   unsigned int final_hash_len;
    ssize_t bytesread;
 
    f = open(file, O_RDONLY);
@@ -125,16 +126,19 @@ sha256_file(char* file, char *returned_hash)
       return errno;
    }
 
-   sha256_init(&ctx);
+   ctx = EVP_MD_CTX_new();
+   EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
    while ((bytesread = read(f, filebuf, sizeof(filebuf))) > 0) {
-      sha256_update(&ctx, filebuf, bytesread);
+      EVP_DigestUpdate(ctx, filebuf, bytesread);
    }
+   close(f);
    if (bytesread < 0) {
+      EVP_MD_CTX_free(ctx);
       return errno;
    }
-   sha256_final(&ctx, final_hash);
-   close(f);
-   hash_2_ascii(final_hash, returned_hash);
+   EVP_DigestFinal_ex(ctx, final_hash, &final_hash_len);
+   EVP_MD_CTX_free(ctx);
+   hash_2_ascii(final_hash, final_hash_len, returned_hash);
    return 0;
 }
 
@@ -326,7 +330,7 @@ libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed)
    }
 
    // Compute sha of associated path
-   char file_sha[2 * SHA256_BLOCK_SIZE + 1];
+   char file_sha[2 * EVP_MAX_MD_SIZE + 1];
    if ((rc = sha256_file(epp->path, file_sha)) != 0) {
       libcrun_fail_with_error(rc, "Couldn't compute hash for file %s", epp->path);
    }
