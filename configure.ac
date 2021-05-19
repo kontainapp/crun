@@ -142,6 +142,10 @@ AC_SEARCH_LIBS([dlopen], [dl], [AC_DEFINE([HAVE_DLOPEN], 1, [Define if DLOPEN is
 
 AC_SEARCH_LIBS([argp_parse], [argp], [], [AC_MSG_ERROR([*** argp functions not found - install libargp or argp_standalone])])
 
+AC_SEARCH_LIBS([CRYPTO_new_ex_data], [crypto], [], [AC_MSG_ERROR([crypto library not found])])
+
+AC_SEARCH_LIBS([OPENSSL_init_ssl], [ssl], [], [AC_MSG_ERROR([ssl library not found])])
+
 AM_CONDITIONAL([PYTHON_BINDINGS], [test "x$with_python_bindings" = "xyes"])
 AM_CONDITIONAL([CRIU_SUPPORT], [test "x$have_criu" = "xyes"])
 
