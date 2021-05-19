@@ -1,7 +1,7 @@
 /*
  * crun - OCI runtime written in C
  *
- * Copyright (C) 2020 Kontain Inc.
+ * Copyright (C) 2020-2021 Kontain Inc.
  * crun is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
  * the Free Software Foundation; either version 2.1 of the License, or
@@ -29,10 +29,10 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "utils.h"
-#include "sha256.h"
+#include <openssl/evp.h>
 
 /*
- * SOmetimes we need to allow programs to be run outside of kontain's vm encapsulation.
+ * Sometimes we need to allow programs to be run outside of kontain's vm encapsulation.
  * But, we don't want arbitrary programs to be run this way.  So, we have a list of acceptable
  * programs that "docker exec ...." should be able to run.  This list is stored in
  * file (see KONTAIN_KRUN_CONFIG definition below).  When it is time to do the
@@ -44,64 +44,65 @@
  * information to form the appropriate exec arguments.
  */
 
-struct execpath_entry {
-   SLIST_ENTRY(execpath_entry) link;
-   regex_t re;
-   char* path;
-   char sha256[SHA256_BLOCK_SIZE * 2 + 1];
+struct execpath_entry
+{
+  SLIST_ENTRY (execpath_entry) link;
+  regex_t re;
+  char *path;
+  char sha256[EVP_MAX_MD_SIZE * 2 + 1];
 };
 typedef struct execpath_entry execpath_entry_t;
 
-SLIST_HEAD(execpath_head, execpath_entry);
+SLIST_HEAD (execpath_head, execpath_entry);
 typedef struct execpath_head execpath_head_t;
 
-struct execpath_state {
-   pthread_mutex_t execpath_mutex;          // do we need this?
-   execpath_head_t execpath_head;
-   char* execpath_dbpath;                   // the path we read to populate the execpath_head
-   struct timespec execpath_mtime;          // dbpath mtime when the file was read
+struct execpath_state
+{
+  pthread_mutex_t execpath_mutex; // do we need this?
+  execpath_head_t execpath_head;
+  char *execpath_dbpath;          // the path we read to populate the execpath_head
+  struct timespec execpath_mtime; // dbpath mtime when the file was read
 };
 typedef struct execpath_state execpath_state_t;
 
-#define KONTAIN_KRUN_CONFIG	"/var/lib/krun/config"
+#define KONTAIN_KRUN_CONFIG "/var/lib/krun/config"
 
 execpath_state_t execpath_state = {
-   PTHREAD_MUTEX_INITIALIZER,
-   SLIST_HEAD_INITIALIZER(&execpath_state.execpath_head),
-   KONTAIN_KRUN_CONFIG,
-   { 0, 0 }
+  PTHREAD_MUTEX_INITIALIZER, SLIST_HEAD_INITIALIZER (&execpath_state.execpath_head), KONTAIN_KRUN_CONFIG, { 0, 0 }
 };
 
 static void
-kontain_execpath_freedb(execpath_state_t* statep)
+kontain_execpath_freedb (execpath_state_t *statep)
 {
-   execpath_entry_t* epp;
+  execpath_entry_t *epp;
 
-   while (!SLIST_EMPTY(&statep->execpath_head)) {
-      epp = SLIST_FIRST(&statep->execpath_head);
-      SLIST_REMOVE_HEAD(&statep->execpath_head, link);
-      free(epp->path);
-      regfree(&epp->re);
-      free(epp);
-   }
-   memset(&statep->execpath_mtime, 0, sizeof(statep->execpath_mtime));
+  while (! SLIST_EMPTY (&statep->execpath_head))
+    {
+      epp = SLIST_FIRST (&statep->execpath_head);
+      SLIST_REMOVE_HEAD (&statep->execpath_head, link);
+      free (epp->path);
+      regfree (&epp->re);
+      free (epp);
+    }
+  memset (&statep->execpath_mtime, 0, sizeof (statep->execpath_mtime));
 }
 
 // Destroy the execpath ok db.
 void
-libcrun_kontain_nonkmexec_clean(void)
+libcrun_kontain_nonkmexec_clean (void)
 {
-   kontain_execpath_freedb(&execpath_state);
+  kontain_execpath_freedb (&execpath_state);
 }
 
 static void
-hash_2_ascii(BYTE hash[SHA256_BLOCK_SIZE], char *ascii)
+hash_2_ascii (unsigned char hash[EVP_MAX_MD_SIZE], unsigned int hash_len, char *ascii)
 {
-   int i;
-   for (i = 0; i < SHA256_BLOCK_SIZE; i++) {
-      snprintf(&ascii[i * 2], 3, "%02x", hash[i]);
-   }
-   ascii[i * 2] = 0;
+  int i;
+  for (i = 0; i < hash_len; i++)
+    {
+      snprintf (&ascii[i * 2], 3, "%02x", hash[i]);
+    }
+  ascii[i * 2] = 0;
 }
 
 /*
@@ -112,51 +113,61 @@ hash_2_ascii(BYTE hash[SHA256_BLOCK_SIZE], char *ascii)
  *   != 0 - an errno value describing what failed
  */
 static int
-sha256_file(char* file, char *returned_hash)
+sha256_file (char *file, char *returned_hash)
 {
-   int f;
-   unsigned char filebuf[128*1024];
-   SHA256_CTX ctx;
-   BYTE final_hash[SHA256_BLOCK_SIZE];
-   ssize_t bytesread;
+  int f;
+  unsigned char filebuf[128 * 1024];
+  EVP_MD_CTX *ctx;
+  unsigned char final_hash[EVP_MAX_MD_SIZE];
+  unsigned int final_hash_len;
+  ssize_t bytesread;
 
-   f = open(file, O_RDONLY);
-   if (f < 0) {
+  f = open (file, O_RDONLY);
+  if (f < 0)
+    {
       return errno;
-   }
+    }
 
-   sha256_init(&ctx);
-   while ((bytesread = read(f, filebuf, sizeof(filebuf))) > 0) {
-      sha256_update(&ctx, filebuf, bytesread);
-   }
-   if (bytesread < 0) {
+  ctx = EVP_MD_CTX_new ();
+  EVP_DigestInit_ex (ctx, EVP_sha256 (), NULL);
+  while ((bytesread = read (f, filebuf, sizeof (filebuf))) > 0)
+    {
+      EVP_DigestUpdate (ctx, filebuf, bytesread);
+    }
+  close (f);
+  if (bytesread < 0)
+    {
+      EVP_MD_CTX_free (ctx);
       return errno;
-   }
-   sha256_final(&ctx, final_hash);
-   close(f);
-   hash_2_ascii(final_hash, returned_hash);
-   return 0;
+    }
+  EVP_DigestFinal_ex (ctx, final_hash, &final_hash_len);
+  EVP_MD_CTX_free (ctx);
+  hash_2_ascii (final_hash, final_hash_len, returned_hash);
+  return 0;
 }
 
 // Split a line from the exec ok file into its fields
 static int
-split_into_fields(char* dbentry, char *fields[])
+split_into_fields (char *dbentry, char *fields[])
 {
-   char* saveptr = NULL;
+  char *saveptr = NULL;
 
-   fields[0] = strtok_r(dbentry, ":", &saveptr);
-   if (fields[0] == NULL) {
+  fields[0] = strtok_r (dbentry, ":", &saveptr);
+  if (fields[0] == NULL)
+    {
       return EINVAL;
-   }
-   fields[1] = strtok_r(NULL, ":", &saveptr);
-   if (fields[0] == NULL) {
+    }
+  fields[1] = strtok_r (NULL, ":", &saveptr);
+  if (fields[0] == NULL)
+    {
       return EINVAL;
-   }
-   fields[2] = strtok_r(NULL, ":", &saveptr);
-   if (fields[2] == NULL) {
+    }
+  fields[2] = strtok_r (NULL, ":", &saveptr);
+  if (fields[2] == NULL)
+    {
       return EINVAL;
-   }
-   return 0;
+    }
+  return 0;
 }
 
 /*
@@ -176,125 +187,145 @@ split_into_fields(char* dbentry, char *fields[])
  * archaic colon separated fields.
  */
 static void
-kontain_execpath_builddb(execpath_state_t* statep)
+kontain_execpath_builddb (execpath_state_t *statep)
 {
-   char buf[1024];
-   FILE* f = NULL;
-   char *fields[3];
-   execpath_entry_t* epp = NULL;
-   execpath_entry_t* tail = NULL;
-   int rc = 0;
+  char buf[1024];
+  FILE *f = NULL;
+  char *fields[3];
+  execpath_entry_t *epp = NULL;
+  execpath_entry_t *tail = NULL;
+  int rc = 0;
 
-   kontain_execpath_freedb(statep);
-   f = fopen(statep->execpath_dbpath, "r");
-   if (f == NULL) {
-      libcrun_fail_with_error(errno, "Couldn't open %s", statep->execpath_dbpath);
-   }
-   buf[sizeof(buf)-1] = 0;
-   while (fgets(buf, sizeof(buf), f) != NULL) {
-      if (buf[sizeof(buf)-1] != 0) {
-         // a really long line.
-         rc = E2BIG;
-         buf[sizeof(buf)-1] = 0;
-         libcrun_fail_with_error(rc, "line: %s in %s is too long: %s", buf, statep->execpath_dbpath);
-      }
-      if (buf[0] == '#') {  // ignore comments
-         continue;
-      }
-      char* s = strchr(buf, '\n');
-      if (s != NULL) {
-         *s = 0;
-      }
+  kontain_execpath_freedb (statep);
+  f = fopen (statep->execpath_dbpath, "r");
+  if (f == NULL)
+    {
+      libcrun_fail_with_error (errno, "Couldn't open %s", statep->execpath_dbpath);
+    }
+  buf[sizeof (buf) - 1] = 0;
+  while (fgets (buf, sizeof (buf), f) != NULL)
+    {
+      if (buf[sizeof (buf) - 1] != 0)
+        {
+          // a really long line.
+          rc = E2BIG;
+          buf[sizeof (buf) - 1] = 0;
+          libcrun_fail_with_error (rc, "line: %s in %s is too long: %s", buf, statep->execpath_dbpath);
+        }
+      if (buf[0] == '#')
+        { // ignore comments
+          continue;
+        }
+      char *s = strchr (buf, '\n');
+      if (s != NULL)
+        {
+          *s = 0;
+        }
       // Split into fields
-      if (split_into_fields(buf, fields) != 0) {
-         rc = EINVAL;
-         libcrun_fail_with_error(rc, "Couldn't split <%s> into fields", buf);
-      }
+      if (split_into_fields (buf, fields) != 0)
+        {
+          rc = EINVAL;
+          libcrun_fail_with_error (rc, "Couldn't split <%s> into fields", buf);
+        }
 
-      epp = calloc(sizeof(execpath_entry_t), 1);
-      if (epp == NULL) {
-         libcrun_fail_with_error(ENOMEM, "Couldn't allocate %d bytes of memory", sizeof(execpath_entry_t));
-      }
+      epp = calloc (sizeof (execpath_entry_t), 1);
+      if (epp == NULL)
+        {
+          libcrun_fail_with_error (ENOMEM, "Couldn't allocate %d bytes of memory", sizeof (execpath_entry_t));
+        }
 
       // Compile regular expression.
-      rc = regcomp(&epp->re, fields[0], REG_EXTENDED | REG_NOSUB);
-      if (rc != 0) {
-         char regerrbuf[128];
-         regerror(rc, &epp->re, regerrbuf, sizeof(regerrbuf));
-         libcrun_fail_with_error(rc, "Couldn't compile regular expression %s, %s", fields[0], regerrbuf);
-      }
-      epp->path = strdup(fields[1]);
-      if (epp->path == NULL) {
-         rc = ENOMEM;
-         libcrun_fail_with_error(rc, "Couldn't strdup %s", fields[1]);
-      }
+      rc = regcomp (&epp->re, fields[0], REG_EXTENDED | REG_NOSUB);
+      if (rc != 0)
+        {
+          char regerrbuf[128];
+          regerror (rc, &epp->re, regerrbuf, sizeof (regerrbuf));
+          libcrun_fail_with_error (rc, "Couldn't compile regular expression %s, %s", fields[0], regerrbuf);
+        }
+      epp->path = strdup (fields[1]);
+      if (epp->path == NULL)
+        {
+          rc = ENOMEM;
+          libcrun_fail_with_error (rc, "Couldn't strdup %s", fields[1]);
+        }
 
       // Compute hash of target file
-      rc = sha256_file(fields[1], epp->sha256);
-      if (rc != 0) {
-         libcrun_fail_with_error(rc, "Couldn't compute hash of file %s", fields[1]);
-      }
+      rc = sha256_file (fields[1], epp->sha256);
+      if (rc != 0)
+        {
+          libcrun_fail_with_error (rc, "Couldn't compute hash of file %s", fields[1]);
+        }
       // Does the hash match what the exec_ok file has?
-      if (strcmp(epp->sha256, fields[2]) != 0) {
-         printf("%s: Computed hash %s doesn't match expected hash %s\n",
-                fields[1],
-                epp->sha256,
-                fields[2]);
-         libcrun_fail_with_error(EILSEQ, "hash on file %s differ: expected: %s got: %s", epp->path, fields[2], epp->sha256);
-      }
+      if (strcmp (epp->sha256, fields[2]) != 0)
+        {
+          printf ("%s: Computed hash %s doesn't match expected hash %s\n", fields[1], epp->sha256, fields[2]);
+          libcrun_fail_with_error (EILSEQ, "hash on file %s differ: expected: %s got: %s", epp->path, fields[2],
+                                   epp->sha256);
+        }
 
       // Chain entry on to the end of the list
-      libcrun_warning("Adding nonkm path: %s, %s, %s", fields[0], fields[1], fields[2]);
-      if (tail == NULL) {
-         SLIST_INSERT_HEAD(&statep->execpath_head, epp, link);
-      } else {
-         SLIST_INSERT_AFTER(tail, epp, link);
-      }
+      libcrun_warning ("Adding nonkm path: %s, %s, %s", fields[0], fields[1], fields[2]);
+      if (tail == NULL)
+        {
+          SLIST_INSERT_HEAD (&statep->execpath_head, epp, link);
+        }
+      else
+        {
+          SLIST_INSERT_AFTER (tail, epp, link);
+        }
       tail = epp;
       epp = NULL;
-   }
-   fclose(f);
+    }
+  fclose (f);
 
-   // Remember the file's mod time
-   struct stat statb;
-   rc = stat(statep->execpath_dbpath, &statb);
-   if (rc == 0) {
+  // Remember the file's mod time
+  struct stat statb;
+  rc = stat (statep->execpath_dbpath, &statb);
+  if (rc == 0)
+    {
       statep->execpath_mtime = statb.st_mtim;
-   } else {
-      libcrun_fail_with_error(errno, "stat %s failed", statep->execpath_dbpath);
-   }
+    }
+  else
+    {
+      libcrun_fail_with_error (errno, "stat %s failed", statep->execpath_dbpath);
+    }
 }
 
 // Find an entry in the execpath_ok db that matches execpath.
 static int
-kontain_execpath_lookup(execpath_state_t* statep, const char* execpath, execpath_entry_t** eppp)
+kontain_execpath_lookup (execpath_state_t *statep, const char *execpath, execpath_entry_t **eppp)
 {
-   int rc;
-   struct stat statb;
+  int rc;
+  struct stat statb;
 
-   if (stat(statep->execpath_dbpath, &statb) != 0) {
-      if (errno != ENOENT) {
-         libcrun_warning("%s: can't access %s, error %s", __FUNCTION__, statep->execpath_dbpath, strerror(errno));
-         return errno;
-      }
+  if (stat (statep->execpath_dbpath, &statb) != 0)
+    {
+      if (errno != ENOENT)
+        {
+          libcrun_warning ("%s: can't access %s, error %s", __FUNCTION__, statep->execpath_dbpath, strerror (errno));
+          return errno;
+        }
       // No allowed executable file, so no executable is allowed to run without km
       *eppp = NULL;
       return 0;
-   }
-   if (memcmp(&statb.st_mtim, &statep->execpath_mtime, sizeof(struct timespec)) != 0) {
-      kontain_execpath_builddb(statep);
-   }
+    }
+  if (memcmp (&statb.st_mtim, &statep->execpath_mtime, sizeof (struct timespec)) != 0)
+    {
+      kontain_execpath_builddb (statep);
+    }
 
-   execpath_entry_t* epp;
-   SLIST_FOREACH(epp, &statep->execpath_head, link) {
-      if (regexec(&epp->re, execpath, 0, NULL, 0) == 0) {
-         // this entry matches
-         *eppp = epp;
-         return 0;
+  execpath_entry_t *epp;
+  SLIST_FOREACH (epp, &statep->execpath_head, link)
+  {
+    if (regexec (&epp->re, execpath, 0, NULL, 0) == 0)
+      {
+        // this entry matches
+        *eppp = epp;
+        return 0;
       }
-   }
-   *eppp = NULL;
-   return 0;
+  }
+  *eppp = NULL;
+  return 0;
 }
 
 /*
@@ -310,36 +341,41 @@ kontain_execpath_lookup(execpath_state_t* statep, const char* execpath, execpath
  *   pointer is null, they can't exec directly to the path passed in execpath.
  */
 int
-libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed)
+libcrun_kontain_nonkmexec_allowed (const char *execpath, char **execpath_allowed)
 {
-   execpath_entry_t* epp;
+  execpath_entry_t *epp;
 
-   // lookup up execpath
-   int rc = kontain_execpath_lookup(&execpath_state, execpath, &epp);
-   if (rc != 0) {
+  // lookup up execpath
+  int rc = kontain_execpath_lookup (&execpath_state, execpath, &epp);
+  if (rc != 0)
+    {
       return rc;
-   }
-   if (epp == NULL) {
+    }
+  if (epp == NULL)
+    {
       // no matching entry, they can't run without km.
       *execpath_allowed = NULL;
       return 0;
-   }
+    }
 
-   // Compute sha of associated path
-   char file_sha[2 * SHA256_BLOCK_SIZE + 1];
-   if ((rc = sha256_file(epp->path, file_sha)) != 0) {
-      libcrun_fail_with_error(rc, "Couldn't compute hash for file %s", epp->path);
-   }
+  // Compute sha of associated path
+  char file_sha[2 * EVP_MAX_MD_SIZE + 1];
+  if ((rc = sha256_file (epp->path, file_sha)) != 0)
+    {
+      libcrun_fail_with_error (rc, "Couldn't compute hash for file %s", epp->path);
+    }
 
-   // If computed sha doesn't match sha in matched entry, fail
-   if (strcmp(file_sha, epp->sha256) != 0) {
-      libcrun_fail_with_error(EACCES, "hashs differ %s - %s", file_sha, epp->sha256);
-   }
+  // If computed sha doesn't match sha in matched entry, fail
+  if (strcmp (file_sha, epp->sha256) != 0)
+    {
+      libcrun_fail_with_error (EACCES, "hashs differ %s - %s", file_sha, epp->sha256);
+    }
 
-   // Return matched path.
-   *execpath_allowed = strdup(epp->path);
-   if (*execpath_allowed == NULL) {
-      libcrun_fail_with_error(ENOMEM, "Couldn't strdup %s", *execpath_allowed);
-   }
-   return 0;
+  // Return matched path.
+  *execpath_allowed = strdup (epp->path);
+  if (*execpath_allowed == NULL)
+    {
+      libcrun_fail_with_error (ENOMEM, "Couldn't strdup %s", *execpath_allowed);
+    }
+  return 0;
 }
