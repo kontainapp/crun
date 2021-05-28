@@ -57,25 +57,8 @@ int libcrun_kontain_argv(char ***argv, const char **execpath)
       // the command does not exist?  Let the caller handle that.
       return errno;
    }
-   if ((statb.st_mode & S_IFMT) == S_IFLNK) {
-      char linkcontents[PATH_MAX];
-      while ((statb.st_mode & S_IFMT) == S_IFLNK) {
-         int rc = readlink(cmd, linkcontents, sizeof(linkcontents));
-         if (rc < 0) {
-            return errno;
-         }
-         linkcontents[rc] = 0;
-         if (strcmp(linkcontents, KM_BIN_PATH) == 0) {
-            // symlink to km, ok
-            return 0;
-         }
-         if (fstatat(AT_FDCWD, linkcontents, &statb, AT_SYMLINK_NOFOLLOW) != 0) {
-            return errno;
-         }
-         cmd = linkcontents;
-      }
-      // symlink to something other than km, stuff km in front of argv[0]
-   } else if (strcmp(cmd, KM_BIN_PATH) == 0) {
+   if (strcmp (cmd, KM_BIN_PATH) == 0)
+   {
       // The command is km, nothing more to do.
       return 0;
    }
