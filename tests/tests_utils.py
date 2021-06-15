@@ -220,11 +220,11 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     # If crun/krun creates these bind mount points they can't be removed for some of the tests.
     head, tail = os.path.split(crun)
     if tail == 'krun':
-        for i in ["opt/kontain/bin/km", "opt/kontain/runtime/libc.so"]:
-            dir, file = os.path.split(i)
-            os.makedirs(os.path.join(rootfs, dir))
-            f = open(os.path.join(rootfs, i), "w")
-            f.close()
+        i = "opt/kontain/bin/km"
+        dir, file = os.path.split(i)
+        os.makedirs(os.path.join(rootfs, dir))
+        f = open(os.path.join(rootfs, i), "w")
+        f.close()
 
     # Let the test add a file into the container. copy_file_in is a 2 item list,
     # item 0 - container relative path of the file, and
