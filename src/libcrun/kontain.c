@@ -1,7 +1,7 @@
 /*
  * crun - OCI runtime written in C
  *
- * Copyright (C) 2020 Kontain Inc.
+ * Copyright (C) 2020-2021 Kontain Inc.
  * crun is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -57,9 +57,10 @@ int libcrun_kontain_argv(char ***argv, const char **execpath)
       // the command does not exist?  Let the caller handle that.
       return errno;
    }
-   if (strcmp (cmd, KM_BIN_PATH) == 0)
+   if (strcmp (cmd, KM_BIN_PATH) == 0 || strcmp(cmd, INIT_PATH) == 0)
    {
-      // The command is km, nothing more to do.
+      // The command is km or docker-init, nothing more to do.
+      // docker-init runs when you supply --init on the docker or podman run command line.
       return 0;
    }
 
