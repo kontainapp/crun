@@ -1,7 +1,7 @@
 /*
  * crun - OCI runtime written in C
  *
- * Copyright (C) 2020 Kontain Inc.
+ * Copyright (C) 2020-2021 Kontain Inc.
  * crun is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -19,6 +19,8 @@
 #define KONTAIN_H
 
 #define KM_BIN_PATH "/opt/kontain/bin/km"
+#define DOCKER_INIT_PATH "/sbin/docker-init"
+#define PODMAN_INIT_PATH "/dev/init"
 int libcrun_kontain_argv(char ***argv, const char **execpath);
 int libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed);
 void libcrun_kontain_nonkmexec_clean(void);
