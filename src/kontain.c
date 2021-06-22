@@ -70,29 +70,27 @@ add_kontain_bind_mounts(libcrun_container_t *container, const char *privileged)
     }
   }
 
-  int new_mounts_len = mounts_len + 2 + need_kvm + need_kkm;
+  int offset = 0;
+  int new_mounts_len = mounts_len + 1 + need_kvm + need_kkm;
   runtime_spec_schema_defs_mount **new_mounts = realloc(mounts, new_mounts_len * sizeof(runtime_spec_schema_defs_mount *));
   if (new_mounts == NULL) {
     return ENOMEM;
   }
   container_def->mounts = new_mounts;
   container_def->mounts[mounts_len] = build_kontain_bind_mount("/opt/kontain/bin/km", "/opt/kontain/bin/km");
-  if (container_def->mounts[mounts_len] == NULL)
+  if (container_def->mounts[mounts_len + offset] == NULL)
     return ENOMEM;
-  container_def->mounts[mounts_len + 1] = build_kontain_bind_mount("/opt/kontain/runtime/libc.so", "/opt/kontain/runtime/libc.so");
-  if (container_def->mounts[mounts_len + 1] == NULL)
-    return ENOMEM;
+  offset++;
 
-  int offset = 0;
   if (need_kvm != 0) {
-    container_def->mounts[mounts_len + 2 + offset] = build_kontain_bind_mount("/dev/kvm", "/dev/kvm");
-    if (container_def->mounts[mounts_len + 2 + offset] == NULL)
+    container_def->mounts[mounts_len + offset] = build_kontain_bind_mount("/dev/kvm", "/dev/kvm");
+    if (container_def->mounts[mounts_len + offset] == NULL)
       return ENOMEM;
     offset++;
   }
   if (need_kkm != 0) {
-    container_def->mounts[mounts_len + 2 + offset] = build_kontain_bind_mount("/dev/kkm", "/dev/kkm");
-    if (container_def->mounts[mounts_len + 2 + offset] == NULL)
+    container_def->mounts[mounts_len + offset] = build_kontain_bind_mount("/dev/kkm", "/dev/kkm");
+    if (container_def->mounts[mounts_len + offset] == NULL)
       return ENOMEM;
     offset++;
   }
