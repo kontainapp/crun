@@ -220,7 +220,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     # If crun/krun creates these bind mount points they can't be removed for some of the tests.
     head, tail = os.path.split(crun)
     if tail == 'krun':
-        for i in ["opt/kontain/bin/km", "opt/kontain/runtime/libc.so"]:
+        for i in ["opt/kontain/bin/km"]:
             dir, file = os.path.split(i)
             os.makedirs(os.path.join(rootfs, dir))
             f = open(os.path.join(rootfs, i), "w")
