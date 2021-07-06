@@ -312,6 +312,16 @@ main (int argc, char **argv)
      arguments.kontain = true;
   }
 
+  char *cmd = strrchr(argv[0], '/');
+  if (cmd == NULL) {
+    cmd = argv[0];
+  } else {
+    cmd++;
+  }
+  if (strcmp(cmd, "krun") == 0) {
+     arguments.kontain = true;
+  }
+
   argp_program_version_hook = print_version;
 
   argp_parse (&argp, argc, argv, ARGP_IN_ORDER, &first_argument, &arguments);

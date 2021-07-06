@@ -66,6 +66,7 @@ def test_exec_not_exists():
 def test_exec_detach_not_exists():
     return test_exec_not_exists_helper(False)
 
+
 def test_exec_additional_gids():
     conf = base_config()
     conf['process']['args'] = ['/init', 'pause']

@@ -168,8 +168,6 @@ crun_command_run (struct crun_global_arguments *global_args, int argc, char **ar
   if (UNLIKELY (ret < 0))
     return ret;
 
-  crun_context.bundle = bundle;
-
   if (crun_context.kontain) {
     ret = add_kontain_config(container);
     if (ret != 0) {
@@ -177,6 +175,7 @@ crun_command_run (struct crun_global_arguments *global_args, int argc, char **ar
     }
   }
 
+  crun_context.bundle = bundle;
   if (getenv ("LISTEN_FDS"))
     crun_context.preserve_fds += strtoll (getenv ("LISTEN_FDS"), NULL, 10);
 

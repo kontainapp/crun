@@ -216,7 +216,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     config_path = os.path.join(temp_dir, relative_config_path)
     config_dir = os.path.dirname(config_path)
     if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
+        os.makedirs(config_dir)0b0b288 (upstream/main) Merge pull request #701 from giuseppe/add-lookup-pids-controller
 
     with open(config_path, "w") as config_file:
         conf = json.dumps(config)
