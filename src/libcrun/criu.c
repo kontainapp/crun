@@ -33,10 +33,178 @@
 #  include "linux.h"
 #  include "status.h"
 #  include "utils.h"
+#  include "cgroup.h"
 
 #  define CRIU_CHECKPOINT_LOG_FILE "dump.log"
 #  define CRIU_RESTORE_LOG_FILE "restore.log"
 #  define DESCRIPTORS_FILENAME "descriptors.json"
+
+static const char *console_socket = NULL;
+
+static int
+criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
+{
+  if (strncmp (action, "orphan-pts-master", 17) == 0)
+    {
+      /* CRIU sends us the master FD via the 'orphan-pts-master'
+       * callback and we are passing it on to the '--console-socket'
+       * if it exists. */
+      cleanup_close int console_socket_fd = -1;
+      int master_fd;
+      int ret;
+
+      if (! console_socket)
+        return 0;
+      master_fd = criu_get_orphan_pts_master_fd ();
+
+      console_socket_fd = open_unix_domain_client_socket (console_socket, 0, NULL);
+      if (UNLIKELY (console_socket_fd < 0))
+        return console_socket_fd;
+      ret = send_fd_to_socket (console_socket_fd, master_fd, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+  return 0;
+}
+
+static int
+restore_cgroup_v1_mount (runtime_spec_schema_config_schema *def, libcrun_error_t *err)
+{
+  cleanup_free char *content = NULL;
+  bool has_cgroup_mount = false;
+  char *saveptr = NULL;
+  int cgroup_mode;
+  char *from;
+  int ret;
+  uint32_t i;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  if (cgroup_mode == CGROUP_MODE_UNIFIED)
+    return 0;
+
+  /* First check if there is actually a cgroup mount in the container. */
+  for (i = 0; i < def->mounts_len; i++)
+    {
+      if (strcmp (def->mounts[i]->type, "cgroup") == 0)
+        {
+          has_cgroup_mount = true;
+          break;
+        }
+    }
+
+  if (! has_cgroup_mount)
+    return 0;
+
+  ret = read_all_file ("/proc/self/cgroup", &content, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (UNLIKELY (content == NULL || content[0] == '\0'))
+    return crun_make_error (err, 0, "invalid content from /proc/self/cgroup");
+
+  for (from = strtok_r (content, "\n", &saveptr); from; from = strtok_r (NULL, "\n", &saveptr))
+    {
+      cleanup_free char *destination = NULL;
+      cleanup_free char *source = NULL;
+      char *subsystem;
+      char *subpath;
+      char *it;
+
+      subsystem = strchr (from, ':') + 1;
+      subpath = strchr (subsystem, ':') + 1;
+      *(subpath - 1) = '\0';
+
+      if (subsystem[0] == '\0')
+        continue;
+
+      it = strstr (subsystem, "name=");
+      if (it)
+        subsystem = it + 5;
+
+      if (strcmp (subsystem, "net_prio,net_cls") == 0)
+        subsystem = "net_cls,net_prio";
+      if (strcmp (subsystem, "cpuacct,cpu") == 0)
+        subsystem = "cpu,cpuacct";
+
+      ret = append_paths (&source, err, CGROUP_ROOT, subsystem, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = append_paths (&destination, err, source, subpath, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      criu_add_ext_mount (source, destination);
+    }
+
+  return 0;
+}
+
+static int
+checkpoint_cgroup_v1_mount (runtime_spec_schema_config_schema *def, libcrun_error_t *err)
+{
+  cleanup_free char *content = NULL;
+  bool has_cgroup_mount = false;
+  char *saveptr = NULL;
+  char *from;
+  int ret;
+  uint32_t i;
+
+  /* First check if there is actually a cgroup mount in the container. */
+  for (i = 0; i < def->mounts_len; i++)
+    {
+      if (strcmp (def->mounts[i]->type, "cgroup") == 0)
+        {
+          has_cgroup_mount = true;
+          break;
+        }
+    }
+
+  if (! has_cgroup_mount)
+    return 0;
+
+  ret = read_all_file ("/proc/self/cgroup", &content, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (UNLIKELY (content == NULL || content[0] == '\0'))
+    return crun_make_error (err, 0, "invalid content from /proc/self/cgroup");
+
+  for (from = strtok_r (content, "\n", &saveptr); from; from = strtok_r (NULL, "\n", &saveptr))
+    {
+      cleanup_free char *source_path = NULL;
+      char *subsystem;
+      char *subpath;
+      char *it;
+
+      subsystem = strchr (from, ':') + 1;
+      subpath = strchr (subsystem, ':') + 1;
+      *(subpath - 1) = '\0';
+
+      if (subsystem[0] == '\0')
+        continue;
+
+      it = strstr (subsystem, "name=");
+      if (it)
+        subsystem = it + 5;
+
+      if (strcmp (subsystem, "net_prio,net_cls") == 0)
+        subsystem = "net_cls,net_prio";
+      if (strcmp (subsystem, "cpuacct,cpu") == 0)
+        subsystem = "cpu,cpuacct";
+
+      ret = append_paths (&source_path, err, CGROUP_ROOT, subsystem, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      criu_add_ext_mount (source_path, source_path);
+    }
+
+  return 0;
+}
 
 int
 libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, libcrun_container_t *container,
@@ -44,11 +212,13 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 {
   runtime_spec_schema_config_schema *def = container->container_def;
   cleanup_free char *descriptors_path = NULL;
+  cleanup_free char *freezer_path = NULL;
   cleanup_close int descriptors_fd = -1;
   cleanup_free char *external = NULL;
   cleanup_free char *path = NULL;
   cleanup_close int image_fd = -1;
   cleanup_close int work_fd = -1;
+  int cgroup_mode;
   size_t i;
   int ret;
 
@@ -91,7 +261,10 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 
   /* descriptors.json is needed during restore to correctly
    * reconnect stdin, stdout, stderr. */
-  xasprintf (&descriptors_path, "%s/%s", cr_options->image_path, DESCRIPTORS_FILENAME);
+  ret = append_paths (&descriptors_path, err, cr_options->image_path, DESCRIPTORS_FILENAME, NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   descriptors_fd = open (descriptors_path, O_CREAT | O_WRONLY | O_CLOEXEC, S_IRUSR | S_IWUSR);
   if (UNLIKELY (descriptors_fd == -1))
     return crun_make_error (err, errno, "error opening descriptors file %s\n", descriptors_path);
@@ -124,11 +297,25 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
    * and all of its children. */
   criu_set_pid (status->pid);
 
-  xasprintf (&path, "%s/%s", status->bundle, status->rootfs);
+  ret = append_paths (&path, err, status->bundle, status->rootfs, NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   ret = criu_set_root (path);
   if (UNLIKELY (ret != 0))
     return crun_make_error (err, 0, "error setting CRIU root to %s\n", path);
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  /* For cgroup v1 we need to tell CRIU to handle all cgroup mounts as external mounts. */
+  if (cgroup_mode != CGROUP_MODE_UNIFIED)
+    {
+      ret = checkpoint_cgroup_v1_mount (def, err);
+      if (UNLIKELY (ret != 0))
+        return crun_make_error (err, 0, "error handling cgroup v1 mounts\n");
+    }
 
   /* Tell CRIU about external bind mounts. */
   for (i = 0; i < def->mounts_len; i++)
@@ -186,11 +373,32 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
         }
     }
 
+  /* Tell CRIU to use the freezer to pause all container processes. */
+  if (cgroup_mode == CGROUP_MODE_UNIFIED)
+    {
+      /* This needs CRIU 3.14. */
+      ret = append_paths (&freezer_path, err, CGROUP_ROOT, status->cgroup_path, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+  else
+    {
+      ret = append_paths (&freezer_path, err, CGROUP_ROOT "/freezer", status->cgroup_path, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  ret = criu_set_freeze_cgroup (freezer_path);
+  if (UNLIKELY (ret != 0))
+    return crun_make_error (err, ret, "CRIU: failed setting freezer %d\n", ret);
+
   /* Set boolean options . */
   criu_set_leave_running (cr_options->leave_running);
   criu_set_ext_unix_sk (cr_options->ext_unix_sk);
   criu_set_shell_job (cr_options->shell_job);
   criu_set_tcp_established (cr_options->tcp_established);
+  criu_set_orphan_pts_master (true);
+  criu_set_manage_cgroups (true);
 
   /* Set up logging. */
   criu_set_log_level (4);
@@ -208,7 +416,7 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 static int
 prepare_restore_mounts (runtime_spec_schema_config_schema *def, char *root, libcrun_error_t *err)
 {
-  int i;
+  uint32_t i;
 
   /* Go through all mountpoints to be able to recreate missing mountpoints. */
   for (i = 0; i < def->mounts_len; i++)
@@ -316,7 +524,10 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     char err_buffer[256];
     yajl_val tree;
 
-    xasprintf (&descriptors_path, "%s/%s", cr_options->image_path, DESCRIPTORS_FILENAME);
+    ret = append_paths (&descriptors_path, err, cr_options->image_path, DESCRIPTORS_FILENAME, NULL);
+    if (UNLIKELY (ret < 0))
+      return ret;
+
     ret = read_all_file (descriptors_path, &buffer, NULL, err);
     if (UNLIKELY (ret < 0))
       return ret;
@@ -394,7 +605,9 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     }
 
   /* Mount the container rootfs for CRIU. */
-  xasprintf (&root, "%s/criu-root", status->bundle);
+  ret = append_paths (&root, err, status->bundle, "criu-root", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   ret = mkdir (root, 0755);
   if (UNLIKELY (ret == -1))
@@ -439,7 +652,7 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
       if (value == CLONE_NEWNET && def->linux->namespaces[i]->path != NULL)
         {
           inherit_fd = open (def->linux->namespaces[i]->path, O_RDONLY);
-          if (UNLIKELY (ret < 0))
+          if (UNLIKELY (inherit_fd < 0))
             return crun_make_error (err, errno, "unable to open(): `%s`", def->linux->namespaces[i]->path);
 
           criu_add_inherit_fd (inherit_fd, "extRootNetNS");
@@ -447,10 +660,20 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
         }
     }
 
+  /* Tell CRIU if cgroup v1 needs to be handled. */
+  ret = restore_cgroup_v1_mount (def, err);
+  if (UNLIKELY (ret < 0))
+    goto out_umount;
+
+  console_socket = cr_options->console_socket;
+  criu_set_notify_cb (criu_notify);
+
   /* Set boolean options . */
   criu_set_ext_unix_sk (cr_options->ext_unix_sk);
   criu_set_shell_job (cr_options->shell_job);
   criu_set_tcp_established (cr_options->tcp_established);
+  criu_set_orphan_pts_master (true);
+  criu_set_manage_cgroups (true);
 
   criu_set_log_level (4);
   criu_set_log_file (CRIU_RESTORE_LOG_FILE);

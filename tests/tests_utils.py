@@ -144,13 +144,15 @@ def parse_proc_status(content):
         r[k] = v.strip()
     return r
 
-def add_all_namespaces(conf, cgroupns=False):
+def add_all_namespaces(conf, cgroupns=False, userns=False):
     has = {}
     for i in conf['linux']['namespaces']:
         has[i['type']] = i['type']
-    namespaces = ['pid', 'user', 'ipc', 'uts', 'network']
+    namespaces = ['pid', 'ipc', 'uts', 'network']
     if cgroupns:
         namespaces = namespaces + ["cgroup"]
+    if userns:
+        namespaces = namespaces + ["user"]
     for i in namespaces:
         if i not in has:
             conf['linux']['namespaces'].append({"type" : i})
@@ -191,8 +193,16 @@ def get_crun_path():
 def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
                        command='run', env=None, use_popen=False, hide_stderr=False,
                        all_dev_null=False, id_container=None, relative_config_path="config.json",
-                       copy_file_in=None):
-    temp_dir = tempfile.mkdtemp(dir=get_tests_root())
+                       chown_rootfs_to=None, copy_file_in=None):
+
+    # Some tests require that the container user, which might not be the
+    # same user as the person running the tests, is able to resolve the full path
+    # to its own tree
+    if chown_rootfs_to is not None:
+        temp_dir = tempfile.mkdtemp()
+    else:
+        temp_dir = tempfile.mkdtemp(dir=get_tests_root())
+
     rootfs = os.path.join(temp_dir, "rootfs")
     os.makedirs(rootfs)
     for i in ["usr/bin", "sbin", "etc", "var", "lib", "lib64", "usr/share/zoneinfo/Europe"]:
@@ -238,6 +248,12 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     os.symlink("../usr/share/zoneinfo/Europe/Rome", os.path.join(rootfs, "etc/localtime"))
     os.symlink("../foo/bar/not/here", os.path.join(rootfs, "etc/not-existing"))
 
+    if chown_rootfs_to is not None:
+        os.chown(temp_dir, chown_rootfs_to, chown_rootfs_to)
+        for root, dirs, files in os.walk(temp_dir):
+            for f in dirs + files:
+                os.chown(os.path.join(root, f), chown_rootfs_to, chown_rootfs_to, follow_symlinks=False)
+
     detach_arg = ['--detach'] if detach else []
     preserve_fds_arg = ['--preserve-fds', str(preserve_fds)] if preserve_fds else []
     pid_file_arg = ['--pid-file', pid_file] if pid_file else []
@@ -280,6 +296,13 @@ def tests_main(all_tests):
     finally:
         shutil.rmtree(tests_root)
 
+def is_rootless():
+    if os.getuid() != 0:
+        return True
+    with open("/proc/self/uid_map") as f:
+        if "4294967295" in f.readline():
+            return False
+    return True
 
 def get_crun_feature_string():
     for i in run_crun_command(['--version']).split('\n'):

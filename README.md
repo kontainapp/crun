@@ -1,6 +1,5 @@
 # crun
 
-[![Build Status](https://travis-ci.org/containers/crun.svg?branch=master)](https://travis-ci.org/containers/crun)
 [![Coverity Status](https://scan.coverity.com/projects/17787/badge.svg)](https://scan.coverity.com/projects/giuseppe-crun)
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/containers/crun.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/containers/crun/alerts/)
 [![Language grade: C/C++](https://img.shields.io/lgtm/grade/cpp/g/containers/crun.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/containers/crun/context:cpp)
@@ -39,15 +38,9 @@ containers, the containers run `/bin/true`:
 | 100 /bin/true | 0:01.69 | 0:3.34 | \-49.4% |
 
 crun requires fewer resources, so it is also possible to set stricter
-limits on the memory and number of PIDs allowed in the container:
+limits on the memory allowed in the container:
 
-``` shell
-# podman --runtime /usr/bin/runc run --rm --pids-limit 1 fedora echo it works
-Error: container_linux.go:346: starting container process caused "process_linux.go:319: getting the final child's pid from pipe caused \"EOF\"": OCI runtime error
-
-# podman --runtime /usr/bin/crun run --rm --pids-limit 1 fedora echo it works
-it works
-
+```console
 # podman --runtime /usr/bin/runc run --rm --memory 4M fedora echo it works
 Error: container_linux.go:346: starting container process caused "process_linux.go:327: getting pipe fds for pid 13859 caused \"readlink /proc/13859/fd/0: no such file or directory\"": OCI runtime command not found error
 
@@ -64,44 +57,62 @@ These dependencies are required for the build:
 
 ### Fedora
 
-``` shell
-dnf install -y make python git gcc automake autoconf libcap-devel \
+```console
+$ sudo dnf install -y make python git gcc automake autoconf libcap-devel \
     systemd-devel yajl-devel libseccomp-devel \
     go-md2man glibc-static python3-libmount libtool
 ```
 
 ### RHEL/CentOS 8
 
-``` shell
-yum --enablerepo='*' install -y make automake autoconf gettext \
+```console
+$ sudo yum --enablerepo='*' --disablerepo='media-*' install -y make automake \
+    autoconf gettext \
     libtool gcc libcap-devel systemd-devel yajl-devel \
-    libseccomp-devel python36 libtool
+    libseccomp-devel python36 libtool git
 ```
 
 go-md2man is not available on RHEL/CentOS 8, so if you'd like to build
 the man page, you also need to manually install go-md2man. It can be
 installed with:
 
-``` shell
-yum --enablerepo='*' install -y golang
-export GOPATH=$HOME/go
-go get github.com/cpuguy83/go-md2man
-export PATH=$PATH:$GOPATH/bin
+```console
+$ sudo yum --enablerepo='*' install -y golang
+$ export GOPATH=$HOME/go
+$ go get github.com/cpuguy83/go-md2man
+$ export PATH=$PATH:$GOPATH/bin
 ```
 
 ### Ubuntu
 
-``` shell
-apt-get install -y make git gcc build-essential pkgconf libtool \
+```console
+$ sudo apt-get install -y make git gcc build-essential pkgconf libtool \
    libsystemd-dev libcap-dev libseccomp-dev libyajl-dev \
    go-md2man libtool autoconf python3 automake
 ```
 
 ### Alpine
 
-``` shell
-apk add gcc automake autoconf libtool gettext pkgconf git make musl-dev \
+```console
+# apk add gcc automake autoconf libtool gettext pkgconf git make musl-dev \
     python3 libcap-dev libseccomp-dev yajl-dev argp-standalone go-md2man
+```
+
+### Tumbleweed
+
+```console
+# zypper install make automake autoconf gettext libtool gcc libcap-devel \
+systemd-devel libyajl-devel libseccomp-devel python3 libtool go-md2man \
+glibc-static;
+```
+
+Note that Tumbleweed requires you to specify libseccomp's header file location
+as a compiler flag.
+
+```console
+# ./autogen.sh
+# ./configure CFLAGS='-I/usr/include/libseccomp'
+# make
 ```
 
 ## Build
@@ -112,16 +123,16 @@ afterwards.
 
 Once all the dependencies are installed:
 
-``` shell
-./autogen.sh
-./configure
-make
+```console
+$ ./autogen.sh
+$ ./configure
+$ make
 ```
 
 To install into default PREFIX (`/usr/local`):
 
-``` shell
-sudo make install
+```console
+$ sudo make install
 ```
 
 ### Shared Libraries
@@ -141,8 +152,11 @@ stripped ELF binary for [glibc](https://www.gnu.org/software/libc).
 
 To build the binaries by locally installing the nix package manager:
 
-``` shell
-nix build -f nix/
+```console
+$ curl -L https://nixos.org/nix/install | sh
+$ git clone --recursive https://github.com/containers/crun.git && cd crun
+$ nix build -f nix/
+$ ./result/bin/crun --version
 ```
 
 ### Ansible
@@ -151,13 +165,13 @@ An [Ansible Role](https://github.com/alvistack/ansible-role-crun) is
 also available to automate the installation of the above statically
 linked binary on its supported OS:
 
-``` shell
-sudo su -
-mkdir -p ~/.ansible/roles
-cd ~/.ansible/roles
-git clone https://github.com/alvistack/ansible-role-crun.git crun
-cd ~/.ansible/roles/crun
-pip3 install --upgrade --ignore-installed --requirement requirements.txt
-molecule converge
-molecule verify
+```console
+$ sudo su -
+# mkdir -p ~/.ansible/roles
+# cd ~/.ansible/roles
+# git clone https://github.com/alvistack/ansible-role-crun.git crun
+# cd ~/.ansible/roles/crun
+# pip3 install --upgrade --ignore-installed --requirement requirements.txt
+# molecule converge
+# molecule verify
 ```

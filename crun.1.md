@@ -59,6 +59,12 @@ Resume the processes in the container.
 **update**
 Update container resource constraints.
 
+**checkpoint**
+Checkpoint a running container using CRIU
+
+**restore**
+Restore a container from a checkpoint
+
 # STATE
 
 By default, when running as root user, crun saves its state under the
@@ -180,6 +186,9 @@ Delete all the containers that satisfy the specified regex.
 
 crun [global options] exec [options] CONTAINER CMD
 
+**--apparmor**=**PROFILE**
+Set the apparmor profile for the process.
+
 **--console-socket**=**SOCKET**
 Path to a UNIX socket that will receive the ptmx end of the tty for
 the container.
@@ -196,11 +205,17 @@ Detach the container process from the current session.
 **--env**=**ENV**
 Specify an environment variable.
 
+**--no-new-privs**
+Set the no new privileges value for the process.
+
 **--preserve-fds**=**N**
 Additional number of FDs to pass into the container.
 
 **--process**=**FILE**
 Path to a file containing the process JSON configuration.
+
+**--process-label**=**VALUE**
+Set the asm process label for the process commonly used with selinux.
 
 **--pid-file**=**PATH**
 Path to the file that will contain the new process PID.
@@ -239,6 +254,9 @@ By default `table` is used.
 ## SPEC OPTIONS
 
 crun [global options] spec [options]
+
+**-b DIR** **--bundle**=**DIR**
+Path to the root of the bundle dir (default ".").
 
 **--rootless**
 Generate a config.json file that is usable by an unprivileged user.
@@ -292,6 +310,56 @@ Maximum number of pids allowed in the container.
 **-r**, **--resources**=**FILE**
 Path to the file containing the resources to update.
 
+## CHECKPOINT OPTIONS
+
+crun [global options] checkpoint [options] CONTAINER
+
+**--image-path**=**DIR**
+Path for saving CRIU image files
+
+**--work-path**=**DIR**
+Path for saving work files and logs
+
+**--leave-running**
+Leave the process running after checkpointing
+
+**--tcp-established**
+Allow open TCP connections
+
+**--ext-unix-sk**
+Allow external UNIX sockets
+
+**--shell-job**
+Allow shell jobs
+
+## RESTORE OPTIONS
+
+crun [global options] restore [options] CONTAINER
+
+**-b DIR** **--bundle**=**DIR**
+Container bundle directory (default ".")
+
+**--image-path**=**DIR**
+Path for saving CRIU image files
+
+**--work-path**=**DIR**
+Path for saving work files and logs
+
+**--tcp-established**
+Allow open TCP connections
+
+**--ext-unix**
+Allow external UNIX sockets
+
+**--shell-job**
+Allow shell jobs
+
+**--detach**
+Detach from the container's process
+
+**--pid-file**=**FILE**
+Where to write the PID of the container
+
 # Extensions to OCI
 
 ## `run.oci.seccomp.receiver=PATH`
@@ -315,6 +383,16 @@ are available on the `ld.so(8)` man page.
 If the annotation `run.oci.seccomp_fail_unknown_syscall` is present, then crun
 will fail when an unknown syscall is encountered in the seccomp configuration.
 
+## `run.oci.seccomp_bpf_data=PATH`
+
+If the annotation `run.oci.seccomp_bpf_data` is present, then crun
+ignores the seccomp section in the OCI configuration file and use the specified data
+as the raw data to the `seccomp(SECCOMP_SET_MODE_FILTER)` syscall.
+The data must be encoded in base64.
+
+It is an experimental feature, and the annotation will be removed once
+it is supported in the OCI runtime specs.
+
 ## `run.oci.keep_original_groups=1`
 
 If the annotation `run.oci.keep_original_groups` is present, then crun
@@ -329,6 +407,18 @@ will override the specified mount point `/PATH` with a cgroup v1 mount
 made of a single hierarchy `none,name=systemd`.
 It is useful to run on a cgroup v2 system containers using older
 versions of systemd that lack support for cgroup v2.
+
+**Note**: Your container host has to have the cgroup v1 mount already present, otherwise
+this will not work. If you want to run the container rootless, the user it runs under
+has to have permissions to this mountpoint.
+
+For example, as root:
+
+```
+mkdir /sys/fs/cgroup/systemd
+mount cgroup -t cgroup /sys/fs/cgroup/systemd -o none,name=systemd,xattr
+chown -R the_user.the_user /sys/fs/cgroup/systemd
+```
 
 ## `run.oci.timens_offset=ID SEC NSEC`
 
@@ -355,6 +445,24 @@ e.g.
 /sys/fs/cgroup//system.slice/foo-352700.scope/container
 ```
 
+## `run.oci.delegate-cgroup=DELEGATED-CGROUP`
+
+If the `run.oci.systemd.subgroup` annotation is specified, yet another
+sub-cgroup is created and the container process is moved here.
+
+```
+/sys/fs/cgroup/$PATH/$SUBGROUP/$DELEGATED-CGROUP
+```
+
+The runtime doesn't apply any limit to the `$DELEGATED-CGROUP`
+sub-cgroup, the runtime uses only `$PATH/$SUBGROUP`.
+
+The container payload fully manages `$DELEGATE-CGROUP`, the limits
+applied to `$PATH/$SUBGROUP` still applies to `$DELEGATE-CGROUP`.
+
+Since cgroup delegation is not safe on cgroup v1, this option is
+supported only on cgroup v2.
+
 ## `run.oci.hooks.stdout=FILE`
 
 If the annotation `run.oci.hooks.stdout` is present, then crun
@@ -369,6 +477,14 @@ will open the specified file and use it as the stderr for the hook
 processes.  The file is opened in append mode and it is created if it
 doesn't already exist.
 
+## `run.oci.handler=HANDLER`
+
+It is an experimental feature.
+
+If specified, run the specified handler for execing the container.
+The only supported value is `krun`.  When `krun` is specified, the
+`libkrun.so` shared object is loaded and it is used to launch the
+container using libkrun.
 
 ## tmpcopyup mount options
 
@@ -384,11 +500,21 @@ The current user is mapped to the ID 0 in the container, and any
 additional id specified in the files `/etc/subuid` and `/etc/subgid`
 is automatically added starting with ID 1.
 
+## Intermediate user namespace
+
+If the configuration specifies a new user namespace made of a single
+mapping to the root user, but either the UID or the GID are set as
+nonzero then crun automatically creates another user namespace to map
+the root user to the specified UID and GID.
+
+It enables running unprivileged containers with UID and GID different
+than zero, even when a single UID and GID are available, e.g. rootless
+users on a system without newuidmap/newgidmap.
+
 # CGROUP v2
 
-crun has some basic support for cgroup v2.  Since the OCI spec is
-designed for cgroup v1, in some cases there is need to convert from
-the cgroup v1 configuration to cgroup v2.
+If the cgroup configuration found is for cgroup v1, crun attempts a
+conversion when running on a cgroup v2 system.
 
 These are the OCI resources currently supported with cgroup v2 and how
 they are converted when needed from the cgroup v1 configuration.
@@ -398,7 +524,7 @@ they are converted when needed from the cgroup v1 configuration.
 | OCI (x) | cgroup 2 value (y) | conversion  |   comment |
 |---|---|---|---|
 | limit | memory.max | y = x ||
-| swap | memory.swap_max | y = x ||
+| swap | memory.swap.max | y = x - memory_limit | the swap limit on cgroup v1 includes the memory usage too |
 | reservation | memory.low | y = x ||
 
 ## PIDs controller
@@ -419,12 +545,12 @@ they are converted when needed from the cgroup v1 configuration.
 
 | OCI (x) | cgroup 2 value (y) | conversion  |   comment |
 |---|---|---|---|
-| weight | io.bfq.weight | y = (1 + (x - 10) * 9999 / 990) | convert linearly from [10-1000] to [1-10000]|
-| weight_device | io.bfq.weight | y = (1 + (x - 10) * 9999 / 990) | convert linearly from [10-1000] to [1-10000]|
-|rbps|io.max|y=x||
-|wbps|io.max|y=x||
-|riops|io.max|y=x||
-|wiops|io.max|y=x||
+| weight | io.bfq.weight | y = x ||
+| weight_device | io.bfq.weight | y = x ||
+| rbps | io.max | y=x ||
+| wbps | io.max | y=x ||
+| riops | io.max |y=x ||
+| wiops | io.max |y=x ||
 
 ## cpuset controller
 

@@ -50,7 +50,14 @@ get_run_directory (const char *state_root)
     {
       const char *runtime_dir = getenv ("XDG_RUNTIME_DIR");
       if (runtime_dir && runtime_dir[0] != '\0')
-        xasprintf (&root, "%s/crun", runtime_dir);
+        {
+          ret = append_paths (&root, &err, runtime_dir, "crun", NULL);
+          if (UNLIKELY (ret < 0))
+            {
+              crun_error_release (&err);
+              return NULL;
+            }
+        }
     }
   if (root == NULL)
     root = xstrdup ("/run/crun");
@@ -64,19 +71,37 @@ get_run_directory (const char *state_root)
 char *
 libcrun_get_state_directory (const char *state_root, const char *id)
 {
-  char *ret;
+  int ret;
+  char *path;
+  libcrun_error_t *err = NULL;
   cleanup_free char *root = get_run_directory (state_root);
-  xasprintf (&ret, "%s/%s", root, id);
-  return ret;
+
+  ret = append_paths (&path, err, root, id, NULL);
+  if (UNLIKELY (ret < 0))
+    {
+      crun_error_release (err);
+      return NULL;
+    }
+
+  return path;
 }
 
 static char *
 get_state_directory_status_file (const char *state_root, const char *id)
 {
-  char *ret;
   cleanup_free char *root = get_run_directory (state_root);
-  xasprintf (&ret, "%s/%s/status", root, id);
-  return ret;
+  libcrun_error_t *err = NULL;
+  char *path = NULL;
+  int ret;
+
+  ret = append_paths (&path, err, root, id, "status", NULL);
+  if (UNLIKELY (ret < 0))
+    {
+      crun_error_release (err);
+      return NULL;
+    }
+
+  return path;
 }
 
 static int
@@ -94,7 +119,7 @@ read_pid_stat (pid_t pid, struct pid_stat *st, libcrun_error_t *err)
   if (fd < 0)
     {
       /* The process already exited.  */
-      if (errno == ENOENT)
+      if (errno == ENOENT || errno == ESRCH)
         {
           memset (st, 0, sizeof (*st));
           return 0;
@@ -146,7 +171,7 @@ int
 libcrun_write_container_status (const char *state_root, const char *id, libcrun_container_status_t *status,
                                 libcrun_error_t *err)
 {
-  int ret;
+  int r, ret;
   cleanup_free char *file = get_state_directory_status_file (state_root, id);
   cleanup_free char *file_tmp = NULL;
   size_t len;
@@ -174,46 +199,107 @@ libcrun_write_container_status (const char *state_root, const char *id, libcrun_
   yajl_gen_config (gen, yajl_gen_beautify, 1);
   yajl_gen_config (gen, yajl_gen_validate_utf8, 1);
 
-  yajl_gen_map_open (gen);
-  yajl_gen_string (gen, YAJL_STR ("pid"), strlen ("pid"));
-  yajl_gen_integer (gen, status->pid);
+  r = yajl_gen_map_open (gen);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("process-start-time"), strlen ("process-start-time"));
-  yajl_gen_integer (gen, status->process_start_time);
+  r = yajl_gen_string (gen, YAJL_STR ("pid"), strlen ("pid"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("cgroup-path"), strlen ("cgroup-path"));
+  r = yajl_gen_integer (gen, status->pid);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR ("process-start-time"), strlen ("process-start-time"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_integer (gen, status->process_start_time);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR ("cgroup-path"), strlen ("cgroup-path"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
   tmp = status->cgroup_path ? status->cgroup_path : "";
-  yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
+  r = yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("scope"), strlen ("scope"));
+  r = yajl_gen_string (gen, YAJL_STR ("scope"), strlen ("scope"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
   tmp = status->scope ? status->scope : "";
-  yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
+  r = yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("rootfs"), strlen ("rootfs"));
-  yajl_gen_string (gen, YAJL_STR (status->rootfs), strlen (status->rootfs));
+  r = yajl_gen_string (gen, YAJL_STR ("rootfs"), strlen ("rootfs"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("systemd-cgroup"), strlen ("systemd-cgroup"));
-  yajl_gen_bool (gen, status->systemd_cgroup);
+  r = yajl_gen_string (gen, YAJL_STR (status->rootfs), strlen (status->rootfs));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("bundle"), strlen ("bundle"));
-  yajl_gen_string (gen, YAJL_STR (status->bundle), strlen (status->bundle));
+  r = yajl_gen_string (gen, YAJL_STR ("systemd-cgroup"), strlen ("systemd-cgroup"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("created"), strlen ("created"));
-  yajl_gen_string (gen, YAJL_STR (status->created), strlen (status->created));
+  r = yajl_gen_bool (gen, status->systemd_cgroup);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("detached"), strlen ("detached"));
-  yajl_gen_bool (gen, status->detached);
+  r = yajl_gen_string (gen, YAJL_STR ("bundle"), strlen ("bundle"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_string (gen, YAJL_STR ("external_descriptors"), strlen ("external_descriptors"));
-  yajl_gen_string (gen, YAJL_STR (status->external_descriptors), strlen (status->external_descriptors));
+  r = yajl_gen_string (gen, YAJL_STR (status->bundle), strlen (status->bundle));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  yajl_gen_map_close (gen);
+  r = yajl_gen_string (gen, YAJL_STR ("created"), strlen ("created"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
-  if (yajl_gen_get_buf (gen, &buf, &len) != yajl_gen_status_ok)
-    {
-      ret = crun_make_error (err, 0, "cannot generate status file");
-      goto exit;
-    }
+  r = yajl_gen_string (gen, YAJL_STR (status->created), strlen (status->created));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR ("owner"), strlen ("owner"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR (status->owner), strlen (status->owner));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR ("detached"), strlen ("detached"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_bool (gen, status->detached);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR ("external_descriptors"), strlen ("external_descriptors"));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_string (gen, YAJL_STR (status->external_descriptors), strlen (status->external_descriptors));
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_map_close (gen);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
+
+  r = yajl_gen_get_buf (gen, &buf, &len);
+  if (UNLIKELY (r != yajl_gen_status_ok))
+    goto yajl_error;
 
   if (UNLIKELY (safe_write (fd_write, buf, (ssize_t) len) < 0))
     {
@@ -234,6 +320,12 @@ exit:
     yajl_gen_free (gen);
 
   return ret;
+
+yajl_error:
+  if (gen)
+    yajl_gen_free (gen);
+
+  return yajl_error_to_crun_error (r, err);
 }
 
 int
@@ -305,6 +397,11 @@ libcrun_read_container_status (libcrun_container_status_t *status, const char *s
     if (UNLIKELY (tmp == NULL))
       return crun_make_error (err, 0, "'created' missing in %s", file);
     status->created = xstrdup (YAJL_GET_STRING (tmp));
+  }
+  {
+    const char *owner[] = { "owner", NULL };
+    tmp = yajl_tree_get (tree, owner, yajl_t_string);
+    status->owner = tmp ? xstrdup (YAJL_GET_STRING (tmp)) : NULL;
   }
   {
     const char *detached[] = { "detached", NULL };
@@ -431,7 +528,7 @@ libcrun_container_delete_status (const char *state_root, const char *id, libcrun
   if (UNLIKELY (dir == NULL))
     return crun_make_error (err, 0, "cannot get state directory");
 
-  rundir_dfd = open (dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+  rundir_dfd = TEMP_FAILURE_RETRY (open (dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
   if (UNLIKELY (rundir_dfd < 0))
     return crun_make_error (err, errno, "cannot open run directory `%s`", dir);
 
@@ -462,16 +559,19 @@ libcrun_free_container_status (libcrun_container_status_t *status)
   free (status->cgroup_path);
   free (status->bundle);
   free (status->rootfs);
+  free (status->external_descriptors);
   free (status->created);
+  free (status->scope);
+  free (status->owner);
 }
 
 int
 libcrun_get_containers_list (libcrun_container_list_t **ret, const char *state_root, libcrun_error_t *err)
 {
   struct dirent *next;
-  libcrun_container_list_t *tmp = NULL;
+  cleanup_container_list libcrun_container_list_t *tmp = NULL;
   cleanup_free char *path = get_run_directory (state_root);
-  cleanup_dir DIR *dir;
+  cleanup_dir DIR *dir = NULL;
 
   *ret = NULL;
   dir = opendir (path);
@@ -480,7 +580,7 @@ libcrun_get_containers_list (libcrun_container_list_t **ret, const char *state_r
 
   for (next = readdir (dir); next; next = readdir (dir))
     {
-      int exists;
+      int r, exists;
       cleanup_free char *status_file = NULL;
 
       libcrun_container_list_t *next_container;
@@ -488,7 +588,10 @@ libcrun_get_containers_list (libcrun_container_list_t **ret, const char *state_r
       if (next->d_name[0] == '.')
         continue;
 
-      xasprintf (&status_file, "%s/%s/status", path, next->d_name);
+      r = append_paths (&status_file, err, path, next->d_name, "status", NULL);
+      if (UNLIKELY (r < 0))
+        return r;
+
       exists = crun_path_exists (status_file, err);
       if (exists < 0)
         {
@@ -505,6 +608,7 @@ libcrun_get_containers_list (libcrun_container_list_t **ret, const char *state_r
       tmp = next_container;
     }
   *ret = tmp;
+  tmp = NULL;
   return 0;
 }
 
@@ -566,9 +670,13 @@ int
 libcrun_status_create_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
 {
   cleanup_free char *state_dir = libcrun_get_state_directory (state_root, id);
-  cleanup_free char *fifo_path;
+  cleanup_free char *fifo_path = NULL;
   int ret, fd = -1;
-  xasprintf (&fifo_path, "%s/exec.fifo", state_dir);
+
+  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   ret = mkfifo (fifo_path, 0600);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "mkfifo");
@@ -584,14 +692,16 @@ int
 libcrun_status_write_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
 {
   cleanup_free char *state_dir = libcrun_get_state_directory (state_root, id);
-  cleanup_free char *fifo_path;
+  cleanup_free char *fifo_path = NULL;
   char buffer[1] = {
     0,
   };
-  int ret;
   cleanup_close int fd = -1;
+  int ret;
 
-  xasprintf (&fifo_path, "%s/exec.fifo", state_dir);
+  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   fd = open (fifo_path, O_WRONLY);
   if (UNLIKELY (fd < 0))
@@ -612,9 +722,12 @@ int
 libcrun_status_has_read_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
 {
   cleanup_free char *state_dir = libcrun_get_state_directory (state_root, id);
-  cleanup_free char *fifo_path;
+  cleanup_free char *fifo_path = NULL;
+  int ret;
 
-  xasprintf (&fifo_path, "%s/exec.fifo", state_dir);
+  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   return crun_path_exists (fifo_path, err);
 }

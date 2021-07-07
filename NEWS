@@ -1,3 +1,97 @@
+* crun-0.20.1
+
+- container: ignore error when resetting the SELinux label for the
+  keyring.
+
+* crun-0.20
+
+- container: call prestart hooks before rootfs is RO.
+- cgroup: added support cleaning custom controllers on cgroupv1.
+- spec: add support for --bundle.
+- exec: add --no-new-privs.
+- exec: add --process-label and --apparmor to change SELinux and
+  AppArmor labels.
+- cgroup: kill procs in cgroup on EBUSY.
+- cgroup: ignore devices errors when running in a user namespace.
+- seccomp: drop SECCOMP_FILTER_FLAG_LOG by default.
+- seccomp: report correct action in error message.
+- apply SELinux label to keyring.
+- add custom annotation run.oci.delegate-cgroup.
+- close_range fallbacks to close on EPERM.
+- report error if the cgroup path was set and the cgroup could not be
+  joined.
+
+* crun-0.19.1
+
+- on exec, honor additional_gids from the process spec, not the
+  container definition.
+- spec: add cgroup ns if on cgroup v2.
+- systemd: support array of strings for cgroup annotation.
+
+* crun-0.19
+
+- join all the cgroup v1 controllers.
+- raise a warning when newuidmap/newgidmap fail.
+- handle eBPF access(dev_name, F_OK) call correctly.
+- fix some memory leaks on errors when libcrun is used by a long
+  running process.
+- fix the SELinux label for masked directories.
+- support default seccomp errno value.
+- fail if no default seccomp action specified.
+- support OCI seccomp notify listener.
+- improve OOM error messages.
+- ignore unknown capabilities and raise a warning.
+- always remount bind mounts to drop not requested mount flags.
+
+* crun-0.18
+
+- fix build without CLONE_NEWCGROUP.
+- fix conversion from blkio to io.
+- add custom annotation to load raw BPF.
+- set working directory for libkrun
+- fix symlink lookup on old kernels that lack openat2
+- skip +cpu on EINVAL in cgroup root.  Enabling the cpu controller is
+  not permitted if there are already realtime processes running on the
+  system.
+- Fix permission error when using NOTIFY_SOCKET with username spaces.
+- set HOME to root if the user not found.
+- simplify mount logic to not use a temporary mount.
+- ignore ENOSYS from keyctl.
+
+* crun-0.17
+
+- allow creating user namespaces without root being mapped.
+- allow arbitrary IDs with single ID userns.
+- use close_range(CLOSE_RANGE_CLOEXEC) where available.
+- honor /sys/kernel/cgroup/delegate.
+- fix an issue with hooks running in the container PID namespace.
+- fix building without seccomp.
+- fix building without libcap.
+
+* crun-0.16
+
+- CRIU support.
+- fallback to openat if openat2 returns EPERM.
+- ignore ENOENT for cgroup v1 mounts, if the mount fails with
+  ENOENT, the controller might have been unmounted.
+- fix another race reading cgroup freeze.  Reading from the cgroup
+  fails with ENODEV if the cgroup was deleted in the meanwhile.
+
+* crun-0.15.1
+
+- add experimental support for libkrun.
+- fix check for pidfd availability on older kernels.
+- linux: do not set data when remounting read-only.  Fix 'ro' mounts
+  on older kernels when SELinux is enabled.
+- linux: label the cgroup v1 tmpfs when SELinux is enabled.
+- container: truncate the pid file before writing to it.
+- exec: fix check for read bytes from the sync socket.
+- check the process has a cgroup before allowing pause and resume.
+- linux: always create a user namespace if not running with euid == 0.
+- libcrun can use a hook instead of executing a container process.
+- use libyajl to generate hooks json input.
+- handle correctly ENOENT for seccomp notifications.
+
 * crun-0.15
 
 - add support for OCI unified cgroup v2.

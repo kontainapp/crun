@@ -29,13 +29,15 @@
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
-#include <sys/capability.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <seccomp.h>
+
+#ifdef HAVE_SECCOMP
+#  include <seccomp.h>
+#endif
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <sys/prctl.h>
@@ -74,6 +76,7 @@ syscall_seccomp (unsigned int operation, unsigned int flags, void *args)
 static unsigned long
 get_seccomp_operator (const char *name, libcrun_error_t *err)
 {
+#ifdef HAVE_SECCOMP
   if (strcmp (name, "SCMP_CMP_NE") == 0)
     return SCMP_CMP_NE;
   if (strcmp (name, "SCMP_CMP_LT") == 0)
@@ -91,11 +94,15 @@ get_seccomp_operator (const char *name, libcrun_error_t *err)
 
   crun_make_error (err, 0, "seccomp get operator", name);
   return 0;
+#else
+  return 0;
+#endif
 }
 
 static unsigned long long
 get_seccomp_action (const char *name, int errno_ret, libcrun_error_t *err)
 {
+#ifdef HAVE_SECCOMP
   const char *p;
 
   p = name;
@@ -110,30 +117,33 @@ get_seccomp_action (const char *name, int errno_ret, libcrun_error_t *err)
     return SCMP_ACT_ERRNO (errno_ret);
   else if (strcmp (p, "KILL") == 0)
     return SCMP_ACT_KILL;
-#ifdef SCMP_ACT_LOG
+#  ifdef SCMP_ACT_LOG
   else if (strcmp (p, "LOG") == 0)
     return SCMP_ACT_LOG;
-#endif
+#  endif
   else if (strcmp (p, "TRAP") == 0)
     return SCMP_ACT_TRAP;
   else if (strcmp (p, "TRACE") == 0)
     return SCMP_ACT_TRACE (errno_ret);
-#ifdef SCMP_ACT_KILL_PROCESS
+#  ifdef SCMP_ACT_KILL_PROCESS
   else if (strcmp (p, "KILL_PROCESS") == 0)
     return SCMP_ACT_KILL_PROCESS;
-#endif
-#ifdef SCMP_ACT_KILL_THREAD
+#  endif
+#  ifdef SCMP_ACT_KILL_THREAD
   else if (strcmp (p, "KILL_THREAD") == 0)
     return SCMP_ACT_KILL_THREAD;
-#endif
-#ifdef SCMP_ACT_NOTIFY
+#  endif
+#  ifdef SCMP_ACT_NOTIFY
   else if (strcmp (p, "NOTIFY") == 0)
     return SCMP_ACT_NOTIFY;
-#endif
+#  endif
 
 fail:
   crun_make_error (err, 0, "seccomp get action", name);
   return 0;
+#else
+  return 0;
+#endif
 }
 
 static void
@@ -149,16 +159,20 @@ make_lowercase (char *str)
 static void
 cleanup_seccompp (void *p)
 {
+#ifdef HAVE_SECCOMP
   scmp_filter_ctx *ctx = (void **) p;
   if (*ctx)
     seccomp_release (*ctx);
+#endif
 }
 #define cleanup_seccomp __attribute__ ((cleanup (cleanup_seccompp)))
 
 int
-libcrun_apply_seccomp (int infd, int listener_receiver_fd, char **seccomp_flags, size_t seccomp_flags_len,
+libcrun_apply_seccomp (int infd, int listener_receiver_fd, const char *receiver_fd_payload,
+                       size_t receiver_fd_payload_len, char **seccomp_flags, size_t seccomp_flags_len,
                        libcrun_error_t *err)
 {
+#ifdef HAVE_SECCOMP
   int ret;
   struct sock_fprog seccomp_filter;
   cleanup_free char *bpf = NULL;
@@ -173,7 +187,7 @@ libcrun_apply_seccomp (int infd, int listener_receiver_fd, char **seccomp_flags,
 
   /* if no seccomp flag was specified use a sane default.  */
   if (seccomp_flags == NULL)
-    flags = SECCOMP_FILTER_FLAG_LOG | SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+    flags = SECCOMP_FILTER_FLAG_SPEC_ALLOW;
   else
     {
       size_t i = 0;
@@ -199,11 +213,11 @@ libcrun_apply_seccomp (int infd, int listener_receiver_fd, char **seccomp_flags,
 
   if (listener_receiver_fd >= 0)
     {
-#ifdef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#  ifdef SECCOMP_FILTER_FLAG_NEW_LISTENER
       flags |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
-#else
+#  else
       return crun_make_error (err, 0, "SECCOMP_FILTER_FLAG_NEW_LISTENER not supported");
-#endif
+#  endif
     }
 
   ret = syscall_seccomp (SECCOMP_SET_MODE_FILTER, flags, &seccomp_filter);
@@ -220,23 +234,39 @@ libcrun_apply_seccomp (int infd, int listener_receiver_fd, char **seccomp_flags,
     {
       int fd = ret;
 
-      ret = send_fd_to_socket (listener_receiver_fd, fd, err);
+      ret = send_fd_to_socket_with_payload (listener_receiver_fd, fd,
+                                            receiver_fd_payload, receiver_fd_payload_len, err);
       if (UNLIKELY (ret < 0))
         return crun_error_wrap (err, "send listener fd `%d` to receiver", fd);
     }
   return 0;
+#else
+  return 0;
+#endif
+}
+
+static bool
+seccomp_action_supports_errno (const char *action)
+{
+  return strcmp (action, "SCMP_ACT_ERRNO") == 0
+         || strcmp (action, "SCMP_ACT_TRACE") == 0;
 }
 
 int
 libcrun_generate_seccomp (libcrun_container_t *container, int outfd, unsigned int options, libcrun_error_t *err)
 {
-  runtime_spec_schema_config_linux_seccomp *seccomp = container->container_def->linux->seccomp;
+#ifdef HAVE_SECCOMP
+  runtime_spec_schema_config_linux_seccomp *seccomp;
   int ret;
   size_t i;
   cleanup_seccomp scmp_filter_ctx ctx = NULL;
-  int action, default_action;
-  const char *def_action = "SCMP_ACT_ALLOW";
+  int action, default_action, default_errno_value = EPERM;
+  const char *def_action = NULL;
 
+  if (container == NULL || container->container_def == NULL || container->container_def->linux == NULL)
+    return 0;
+
+  seccomp = container->container_def->linux->seccomp;
   if (seccomp == NULL)
     return 0;
 
@@ -244,10 +274,19 @@ libcrun_generate_seccomp (libcrun_container_t *container, int outfd, unsigned in
   if (prctl (PR_GET_SECCOMP, 0, 0, 0, 0) < 0)
     return crun_make_error (err, errno, "prctl");
 
-  if (seccomp->default_action != NULL)
-    def_action = seccomp->default_action;
+  def_action = seccomp->default_action;
+  if (def_action == NULL)
+    return crun_make_error (err, 0, "seccomp misses the default action");
 
-  default_action = get_seccomp_action (def_action, EPERM, err);
+  if (seccomp->default_errno_ret_present)
+    {
+      if (! seccomp_action_supports_errno (def_action))
+        return crun_make_error (err, 0, "errno value specified for action `%s`", def_action);
+
+      default_errno_value = seccomp->default_errno_ret;
+    }
+
+  default_action = get_seccomp_action (def_action, default_errno_value, err);
   if (UNLIKELY (err && *err != NULL))
     return crun_make_error (err, 0, "invalid seccomp action `%s`", seccomp->default_action);
 
@@ -259,19 +298,22 @@ libcrun_generate_seccomp (libcrun_container_t *container, int outfd, unsigned in
     {
       uint32_t arch_token;
       const char *arch = seccomp->architectures[i];
-      char lowercase_arch[32];
+      char *end, lowercase_arch[32] = {
+        0,
+      };
 
       if (has_prefix (arch, "SCMP_ARCH_"))
         arch += 10;
-      stpncpy (lowercase_arch, arch, sizeof (lowercase_arch));
+      end = stpncpy (lowercase_arch, arch, sizeof (lowercase_arch) - 1);
+      *end = '\0';
       make_lowercase (lowercase_arch);
-#ifdef SECCOMP_ARCH_RESOLVE_NAME
+#  ifdef SECCOMP_ARCH_RESOLVE_NAME
       arch_token = seccomp_arch_resolve_name (lowercase_arch);
       if (arch_token == 0)
         return crun_make_error (err, 0, "seccomp unknown architecture %s", arch);
-#else
+#  else
       arch_token = SCMP_ARCH_NATIVE;
-#endif
+#  endif
       ret = seccomp_arch_add (ctx, arch_token);
       if (ret < 0 && ret != -EEXIST)
         return crun_make_error (err, -ret, "seccomp adding architecture");
@@ -283,7 +325,11 @@ libcrun_generate_seccomp (libcrun_container_t *container, int outfd, unsigned in
       int errno_ret = EPERM;
 
       if (seccomp->syscalls[i]->errno_ret_present)
-        errno_ret = seccomp->syscalls[i]->errno_ret;
+        {
+          if (! seccomp_action_supports_errno (seccomp->syscalls[i]->action))
+            return crun_make_error (err, 0, "errno value specified for action `%s`", seccomp->syscalls[i]->action);
+          errno_ret = seccomp->syscalls[i]->errno_ret;
+        }
 
       action = get_seccomp_action (seccomp->syscalls[i]->action, errno_ret, err);
       if (UNLIKELY (err && *err != NULL))
@@ -375,4 +421,7 @@ libcrun_generate_seccomp (libcrun_container_t *container, int outfd, unsigned in
     }
 
   return 0;
+#else
+  return 0;
+#endif
 }

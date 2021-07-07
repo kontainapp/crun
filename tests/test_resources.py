@@ -28,14 +28,14 @@ def is_cgroup_v2_unified():
     return subprocess.check_output("stat -c%T -f /sys/fs/cgroup".split()).decode("utf-8").strip() == "cgroup2fs"
 
 def test_resources_pid_limit():
-    if os.getuid() != 0:
+    if is_rootless():
         return 77
     conf = base_config()
     conf['linux']['resources'] = {"pids" : {"limit" : 1024}}
     add_all_namespaces(conf)
 
     fn = "/sys/fs/cgroup/pids/pids.max"
-    if not os.path.exists("/sys/fs/cgroup/pids"):
+    if is_cgroup_v2_unified():
         fn = "/sys/fs/cgroup/pids.max"
         conf['linux']['namespaces'].append({"type" : "cgroup"})
 
@@ -43,11 +43,50 @@ def test_resources_pid_limit():
 
     out, _ = run_and_get_output(conf)
     if "1024" not in out:
+        sys.stderr.write("found %s instead of 1024\n" % out)
+        return -1
+    return 0
+
+def test_resources_pid_limit_userns():
+    if is_rootless():
+        return 77
+
+    conf = base_config()
+    conf['linux']['resources'] = {"pids" : {"limit" : 1024}}
+    add_all_namespaces(conf)
+
+    mappings = [
+        {
+            "containerID": 0,
+            "hostID": 1,
+            "size": 1,
+        },
+        {
+            "containerID": 1,
+            "hostID": 0,
+            "size": 1,
+        }
+    ]
+
+    conf['linux']['namespaces'].append({"type" : "user"})
+    conf['linux']['uidMappings'] = mappings
+    conf['linux']['gidMappings'] = mappings
+
+    fn = "/sys/fs/cgroup/pids/pids.max"
+    if is_cgroup_v2_unified():
+        fn = "/sys/fs/cgroup/pids.max"
+        conf['linux']['namespaces'].append({"type" : "cgroup"})
+
+    conf['process']['args'] = ['/init', 'cat', fn]
+
+    out, _ = run_and_get_output(conf)
+    if "1024" not in out:
+        sys.stderr.write("found %s instead of 1024\n" % out)
         return -1
     return 0
 
 def test_resources_unified_invalid_controller():
-    if not is_cgroup_v2_unified() or os.geteuid() != 0:
+    if not is_cgroup_v2_unified() or is_rootless():
         return 77
 
     conf = base_config()
@@ -64,7 +103,7 @@ def test_resources_unified_invalid_controller():
         # must raise an exception, fail if it doesn't.
         return -1
     except Exception as e:
-        if 'the requested controller `foo` is not available' in e.stdout.decode("utf-8").strip():
+        if 'the requested cgroup controller `foo` is not available' in e.stdout.decode("utf-8").strip():
             return 0
         return -1
     finally:
@@ -73,7 +112,7 @@ def test_resources_unified_invalid_controller():
     return 0
 
 def test_resources_unified_invalid_key():
-    if not is_cgroup_v2_unified() or os.geteuid() != 0:
+    if not is_cgroup_v2_unified() or is_rootless():
         return 77
 
     conf = base_config()
@@ -99,7 +138,7 @@ def test_resources_unified_invalid_key():
     return 0
 
 def test_resources_unified():
-    if not is_cgroup_v2_unified() or os.geteuid() != 0:
+    if not is_cgroup_v2_unified() or is_rootless():
         return 77
 
     conf = base_config()
@@ -125,6 +164,7 @@ def test_resources_unified():
 
 all_tests = {
     "resources-pid-limit" : test_resources_pid_limit,
+    "resources-pid-limit-userns" : test_resources_pid_limit_userns,
     "resources-unified" : test_resources_unified,
     "resources-unified-invalid-controller" : test_resources_unified_invalid_controller,
     "resources-unified-invalid-key" : test_resources_unified_invalid_key,

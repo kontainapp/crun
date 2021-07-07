@@ -37,30 +37,38 @@ libcrun_SOURCES = src/libcrun/utils.c \
 			src/libcrun/kontain.c \
 			src/libcrun/kontain_nonkmexec.c
 
+if HAVE_EMBEDDED_YAJL
+maybe_libyajl.la = libocispec/yajl/libyajl.la
+else
+maybe_libyajl.la =
+endif
+
+libocispec/libocispec.la:
+	$(MAKE) $(AM_MAKEFLAGS) -C libocispec libocispec.la
 
 libcrun_la_SOURCES = $(libcrun_SOURCES)
 libcrun_la_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -fvisibility=hidden
-libcrun_la_LIBADD = libocispec/libocispec.la
+libcrun_la_LIBADD = libocispec/libocispec.la $(maybe_libyajl.la)
 libcrun_la_LDFLAGS = -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds
 
 # build a version with all the symbols visible for testing
 libcrun_testing_a_SOURCES = $(libcrun_SOURCES)
 libcrun_testing_a_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -fvisibility=default
-libcrun_testing_a_LIBADD = libocispec/libocispec.la
+libcrun_testing_a_LIBADD = libocispec/libocispec.la $(maybe_libyajl.la)
 
 if PYTHON_BINDINGS
 pyexec_LTLIBRARIES = python_crun.la
 python_crun_la_SOURCES = python/crun_python.c
 python_crun_la_CFLAGS = -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/libocispec/src -I $(abs_top_builddir)/src $(PYTHON_CFLAGS)
 python_crun_la_LDFLAGS = -avoid-version -module $(PYTHON_LDFLAGS)
-python_crun_la_LIBADD = libcrun.la $(PYTHON_LIBS) $(FOUND_LIBS)
+python_crun_la_LIBADD = libcrun.la $(PYTHON_LIBS) $(FOUND_LIBS) $(maybe_libyajl.la)
 endif
 
 crun_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src
 crun_SOURCES = src/crun.c src/run.c src/delete.c src/kill.c src/pause.c src/unpause.c src/spec.c \
 		src/exec.c src/list.c src/create.c src/start.c src/state.c src/update.c src/ps.c \
 		src/checkpoint.c src/restore.c src/kontain.c src/debug.c
-crun_LDADD = libcrun.la $(FOUND_LIBS)
+crun_LDADD = libcrun.la $(FOUND_LIBS) $(maybe_libyajl.la)
 crun_LDFLAGS = $(CRUN_LDFLAGS)
 
 EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md rpm/crun.spec.in autogen.sh \
@@ -75,18 +83,23 @@ EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md rpm/crun.spec.in
 UNIT_TESTS = tests/tests_libcrun_utils tests/tests_libcrun_errors
 
 bin_PROGRAMS = crun
-noinst_PROGRAMS = tests/init $(UNIT_TESTS)
+noinst_PROGRAMS = tests/init $(UNIT_TESTS) tests/tests_libcrun_fuzzer
 
-TESTS_LDADD = libcrun_testing.a $(FOUND_LIBS)
+TESTS_LDADD = libcrun_testing.a $(FOUND_LIBS) $(maybe_libyajl.la)
 
 tests_init_LDADD =
 tests_init_LDFLAGS = -static-libgcc -all-static
-tests_init_SOURCES = tests/init.c $(UNIT_TESTS)
+tests_init_SOURCES = tests/init.c
 
 tests_tests_libcrun_utils_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_utils_SOURCES = tests/tests_libcrun_utils.c
 tests_tests_libcrun_utils_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_utils_LDFLAGS = $(crun_LDFLAGS)
+
+tests_tests_libcrun_fuzzer_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_fuzzer_SOURCES = tests/tests_libcrun_fuzzer.c
+tests_tests_libcrun_fuzzer_LDADD = $(TESTS_LDADD) libocispec/libocispec.la $(maybe_libyajl.la)
+tests_tests_libcrun_fuzzer_LDFLAGS = $(crun_LDFLAGS)
 
 tests_tests_libcrun_errors_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_errors_SOURCES = tests/tests_libcrun_errors.c
@@ -118,6 +131,7 @@ TESTS = tests/test_capabilities.py \
 	tests/test_resources.py \
 	tests/test_start.py \
 	tests/test_exec.py \
+	tests/test_seccomp.py \
 	$(UNIT_TESTS)
 
 .version:
@@ -129,7 +143,7 @@ git-version.h:
 	fi
 
 nixpkgs:
-	@nix run -f channel:nixos-20.03 nix-prefetch-git -c nix-prefetch-git \
+	@nix run -f channel:nixos-20.09 nix-prefetch-git -c nix-prefetch-git \
 		--no-deepClone https://github.com/nixos/nixpkgs > nix/nixpkgs.json
 
 dist-hook:
@@ -149,7 +163,7 @@ endif HAVE_MD2MAN
 generate-man: crun.1
 
 sync:
-	(cd libocispec; git pull https://github.com/containers/libocispec)
+	(cd libocispec; git pull https://github.com/containers/libocispec main)
 
 coverity:
 	$(MAKE) $(AM_MAKEFLAGS) -C libocispec

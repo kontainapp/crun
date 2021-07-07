@@ -51,6 +51,22 @@ def test_some_caps():
             return -1
     return 0
 
+def test_unknown_caps():
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'cat', '/proc/self/status']
+    add_all_namespaces(conf)
+    conf['process']['capabilities'] = {}
+    # unknown caps must be ignored
+    for i in ['bounding', 'effective', 'inheritable', 'permitted', 'ambient']:
+        conf['process']['capabilities'][i] = ['CAP_UNKNOWN', 'UNKNOWN_CAP']
+    out, _ = run_and_get_output(conf)
+    proc_status = parse_proc_status(out)
+
+    for i in ['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb']:
+        if proc_status[i] != "0000000000000000":
+            return -1
+    return 0
+
 def test_new_privs():
     conf = base_config()
     conf['process']['args'] = ['/init', 'cat', '/proc/self/status']
@@ -61,13 +77,23 @@ def test_new_privs():
     proc_status = parse_proc_status(out)
     no_new_privs = proc_status['NoNewPrivs']
     if no_new_privs != "1":
+        print("invalid value for NoNewPrivs, found %s" % no_new_privs)
         return -1
+
+    with open("/proc/self/status") as f:
+        host_proc_status = parse_proc_status("\n".join(f.readlines()))
+        no_new_privs = proc_status['NoNewPrivs']
+        # if nonewprivs is already set, it cannot be unset, so skip the
+        # next test
+        if no_new_privs:
+            return 0
 
     conf['process']['noNewPrivileges'] = False
     out, _ = run_and_get_output(conf)
     proc_status = parse_proc_status(out)
     no_new_privs = proc_status['NoNewPrivs']
     if no_new_privs != "0":
+        print("invalid value for NoNewPrivs, found %s" % no_new_privs)
         return -1
 
     return 0
@@ -126,7 +152,8 @@ all_tests = {
     "some-caps-bounding-non-root" : test_some_caps_bounding_non_root,
     "some-caps-inheritable-non-root" : test_some_caps_inheritable_non_root,
     "some-caps-ambient-non-root" : test_some_caps_ambient_non_root,
-    "some-caps-permitted-non-root" : test_some_caps_permitted_non_root
+    "some-caps-permitted-non-root" : test_some_caps_permitted_non_root,
+    "unknown-caps" : test_unknown_caps,
 }
 
 if __name__ == "__main__":

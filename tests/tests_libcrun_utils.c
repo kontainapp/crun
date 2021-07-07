@@ -18,6 +18,7 @@
 
 #include <libcrun/error.h>
 #include <libcrun/utils.h>
+#include <libcrun/cgroup.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <string.h>
@@ -247,6 +248,127 @@ test_crun_path_exists ()
   return 0;
 }
 
+static int
+test_append_paths ()
+{
+#define PROLOGUE()                              \
+  cleanup_free char *out = NULL;                \
+  libcrun_error_t err = NULL;                   \
+  int ret;
+
+#define EXPECT_STRING(exp)                      \
+  {                                             \
+    if (ret < 0 || out == NULL)                 \
+      {                                         \
+        crun_error_release (&err);              \
+        return ret;                             \
+      }                                         \
+    if (strcmp (out, exp))                      \
+      return -1;                                \
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "/sys/fs/cgroup/", "memory", "some/path", NULL);
+    EXPECT_STRING ("/sys/fs/cgroup/memory/some/path");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "/sys/fs/cgroup", "memory", "some/path", NULL);
+    EXPECT_STRING ("/sys/fs/cgroup/memory/some/path");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "/sys/fs/cgroup////////", "memory////////", "some/path//////", NULL);
+    EXPECT_STRING ("/sys/fs/cgroup/memory/some/path");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "/sys/fs/cgroup////////", "memory////////", "///////some/path//////", NULL);
+    EXPECT_STRING ("/sys/fs/cgroup/memory/some/path");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "", "//", "", "", "", NULL);
+    EXPECT_STRING ("/");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "///", "/", "", "///", "a", NULL);
+    EXPECT_STRING ("/a");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "////", "/////", "///", "", "", NULL);
+    EXPECT_STRING ("/");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "", "", "", "", "", NULL);
+    EXPECT_STRING ("");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "", "///sys/fs/cgroup////////", "", "some/path", NULL);
+    EXPECT_STRING ("/sys/fs/cgroup/some/path");
+  }
+  {
+    PROLOGUE ();
+    ret = append_paths (&out, &err, "a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c", "d",
+                        "a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c", "d",
+                        "a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c", "d", NULL);
+    if (ret == 0)
+      return -1;
+    crun_error_release (&err);
+  }
+  return 0;
+}
+
+#ifdef HAVE_SYSTEMD
+static int
+test_parse_sd_array ()
+{
+  char *out, *next;
+  libcrun_error_t err = NULL;
+  {
+    cleanup_free char *s = xstrdup ("       'firewalld.service'    ");
+    if (parse_sd_array (s, &out, &next, &err) < 0)
+      {
+        crun_error_release (&err);
+        return -1;
+      }
+    if (strcmp (out, "firewalld.service"))
+      return -1;
+    if (next != NULL)
+      return -1;
+  }
+  {
+    cleanup_free char *s = xstrdup ("'fir\\ewalld.ser\\vi\\ce']");
+    if (parse_sd_array (s, &out, &next, &err) < 0)
+      {
+        crun_error_release (&err);
+        return -1;
+      }
+    if (strcmp (out, "firewalld.service"))
+      return -1;
+    if (next != NULL)
+      return -1;
+  }
+  {
+    cleanup_free char *s = xstrdup ("'fi\\rew\\alld.s\\erv\\ice', 'foo.service']");
+    if (parse_sd_array (s, &out, &next, &err) < 0)
+      {
+        crun_error_release (&err);
+        return -1;
+      }
+    if (strcmp (out, "firewalld.service"))
+      return -1;
+    if (strcmp (next, " 'foo.service']"))
+      return -1;
+  }
+  return 0;
+}
+#endif
+
 static void
 run_and_print_test_result (const char *name, int id, test t)
 {
@@ -265,12 +387,16 @@ int
 main ()
 {
   int id = 1;
-  printf ("1..6\n");
+  printf ("1..7\n");
   RUN_TEST (test_crun_path_exists);
   RUN_TEST (test_write_read_file);
   RUN_TEST (test_run_process);
   RUN_TEST (test_dir_p);
   RUN_TEST (test_socket_pair);
   RUN_TEST (test_send_receive_fd);
+  RUN_TEST (test_append_paths);
+#ifdef HAVE_SYSTEMD
+  RUN_TEST (test_parse_sd_array);
+#endif
   return 0;
 }

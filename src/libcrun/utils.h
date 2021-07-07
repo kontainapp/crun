@@ -26,7 +26,9 @@
 #include "error.h"
 #include <dirent.h>
 #include <unistd.h>
+#include <signal.h>
 #include <runtime_spec_schema_config_schema.h>
+#include <sys/wait.h>
 #include "container.h"
 
 #ifndef TEMP_FAILURE_RETRY
@@ -46,6 +48,7 @@
 #define cleanup_close_vec __attribute__ ((cleanup (cleanup_close_vecp)))
 #define cleanup_dir __attribute__ ((cleanup (cleanup_dirp)))
 #define arg_unused __attribute__ ((unused))
+#define cleanup_pid __attribute__ ((cleanup (cleanup_pidp)))
 
 #define LIKELY(x) __builtin_expect ((x), 1)
 #define UNLIKELY(x) __builtin_expect ((x), 0)
@@ -101,6 +104,17 @@ cleanup_closep (void *p)
 }
 
 static inline void
+cleanup_pidp (void *p)
+{
+  pid_t *pp = p;
+  if (*pp > 0)
+    {
+      TEMP_FAILURE_RETRY (kill (*pp, SIGKILL));
+      TEMP_FAILURE_RETRY (waitpid (*pp, NULL, 0));
+    }
+}
+
+static inline void
 cleanup_close_vecp (int **p)
 {
   int *pp = *p;
@@ -145,6 +159,14 @@ xstrdup (const char *str)
   return ret;
 }
 
+static inline const char *
+consume_slashes (const char *t)
+{
+  while (*t == '/')
+    t++;
+  return t;
+}
+
 int xasprintf (char **str, const char *fmt, ...);
 
 int crun_path_exists (const char *path, libcrun_error_t *err);
@@ -162,6 +184,8 @@ int crun_ensure_file (const char *path, int mode, bool nofollow, libcrun_error_t
 int crun_ensure_directory_at (int dirfd, const char *path, int mode, bool nofollow, libcrun_error_t *err);
 
 int crun_ensure_file_at (int dirfd, const char *path, int mode, bool nofollow, libcrun_error_t *err);
+
+int crun_safe_create_and_open_ref_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode, libcrun_error_t *err);
 
 int crun_safe_ensure_directory_at (int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
                                    libcrun_error_t *err);
@@ -197,6 +221,8 @@ int open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err);
 
 int send_fd_to_socket (int server, int fd, libcrun_error_t *err);
 
+int send_fd_to_socket_with_payload (int server, int fd, const char *payload, size_t payload_len, libcrun_error_t *err);
+
 int create_socket_pair (int *pair, libcrun_error_t *err);
 
 int receive_fd_from_socket (int from, libcrun_error_t *err);
@@ -214,7 +240,7 @@ size_t format_default_id_mapping (char **ret, uid_t container_id, uid_t host_id,
 int run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, int timeout, char **envp,
                                          char *stdin, size_t stdin_len, int out_fd, int err_fd, libcrun_error_t *err);
 
-int close_fds_ge_than (int n, libcrun_error_t *err);
+int mark_for_close_fds_ge_than (int n, libcrun_error_t *err);
 
 void get_current_timestamp (char *out);
 
@@ -242,11 +268,17 @@ int get_file_type (mode_t *mode, bool nofollow, const char *path);
 
 int get_file_type_fd (int fd, mode_t *mode);
 
+char *get_user_name (uid_t uid);
+
 int safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path, int flags, int mode,
                  libcrun_error_t *err);
 
 ssize_t safe_write (int fd, const void *buf, ssize_t count);
 
+int append_paths (char **out, libcrun_error_t *err, ...);
+
 LIBCRUN_PUBLIC int libcrun_str2sig (const char *name);
+
+int base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t *nbytes);
 
 #endif

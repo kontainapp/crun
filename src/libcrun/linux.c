@@ -31,7 +31,9 @@
 #endif
 #include <sys/syscall.h>
 #include <sys/prctl.h>
-#include <sys/capability.h>
+#ifdef HAVE_CAP
+#  include <sys/capability.h>
+#endif
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sysmacros.h>
@@ -62,6 +64,18 @@
 #  define RLIMIT_RTTIME 15
 #endif
 
+#ifndef OPEN_TREE_CLONE
+#  define OPEN_TREE_CLONE 1
+#endif
+
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#  define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+
+#ifndef MOVE_MOUNT_T_EMPTY_PATH
+#  define MOVE_MOUNT_T_EMPTY_PATH 0x00000040
+#endif
+
 struct remount_s
 {
   struct remount_s *next;
@@ -90,9 +104,7 @@ struct private_data_s
   int procfsfd;
   int mqueuefsfd;
   size_t rootfs_len;
-
-  char *tmpmountdir;
-  char *tmpmountfile;
+  int notify_socket_tree_fd;
 
   /* Used to save stdin, stdout, stderr during checkpointing to descriptors.json
    * and needed during restore. */
@@ -116,9 +128,20 @@ get_private_data (struct libcrun_container_s *container)
       p->rootfsfd = -1;
       p->procfsfd = -1;
       p->mqueuefsfd = -1;
+      p->notify_socket_tree_fd = -1;
     }
   return container->private_data;
 }
+
+#ifndef CLONE_NEWTIME
+#  define CLONE_NEWTIME 0
+#endif
+#ifndef CLONE_NEWCGROUP
+#  define CLONE_NEWCGROUP 0
+#endif
+#ifndef AT_RECURSIVE
+#  define AT_RECURSIVE 0x8000
+#endif
 
 static struct linux_namespace_s namespaces[] = { { "mount", "mnt", CLONE_NEWNS },
                                                  { "network", "net", CLONE_NEWNET },
@@ -126,10 +149,10 @@ static struct linux_namespace_s namespaces[] = { { "mount", "mnt", CLONE_NEWNS }
                                                  { "pid", "pid", CLONE_NEWPID },
                                                  { "uts", "uts", CLONE_NEWUTS },
                                                  { "user", "user", CLONE_NEWUSER },
-#ifdef CLONE_NEWCGROUP
+#if CLONE_NEWCGROUP
                                                  { "cgroup", "cgroup", CLONE_NEWCGROUP },
 #endif
-#ifdef CLONE_NEWTIME
+#if CLONE_NEWTIME
                                                  { "time", "time", CLONE_NEWTIME },
 #endif
                                                  { NULL, NULL, 0 } };
@@ -168,7 +191,9 @@ syscall_fsopen (const char *fs_name, unsigned int flags)
 #if defined __NR_fsopen
   return (int) syscall (__NR_fsopen, fs_name, flags);
 #else
-  errno = ENOTSUP;
+  (void) fs_name;
+  (void) flags;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -179,7 +204,10 @@ syscall_fsmount (int fsfd, unsigned int flags, unsigned int attr_flags)
 #if defined __NR_fsmount
   return (int) syscall (__NR_fsmount, fsfd, flags, attr_flags);
 #else
-  errno = ENOTSUP;
+  (void) fsfd;
+  (void) flags;
+  (void) attr_flags;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -190,7 +218,12 @@ syscall_fsconfig (int fsfd, unsigned int cmd, const char *key, const void *val, 
 #if defined __NR_fsconfig
   return (int) syscall (__NR_fsconfig, fsfd, cmd, key, val, aux);
 #else
-  errno = ENOTSUP;
+  (void) fsfd;
+  (void) cmd;
+  (void) key;
+  (void) val;
+  (void) aux;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -202,7 +235,29 @@ syscall_move_mount (int from_dfd, const char *from_pathname, int to_dfd, const c
 #if defined __NR_move_mount
   return (int) syscall (__NR_move_mount, from_dfd, from_pathname, to_dfd, to_pathname, flags);
 #else
-  errno = ENOTSUP;
+  (void) from_dfd;
+  (void) from_pathname;
+  (void) to_dfd;
+  (void) to_pathname;
+  (void) flags;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+/* ignore this being unused - it's (currently) only unused if not building with systemd,
+   but conditioning the definition of syscall_open_tree on HAVE_SYSTEMD seems pretty silly */
+__attribute__ ((unused)) static int
+syscall_open_tree (int dfd, const char *pathname, unsigned int flags)
+
+{
+#if defined __NR_open_tree
+  return (int) syscall (__NR_open_tree, dfd, pathname, flags);
+#else
+  (void) dfd;
+  (void) pathname;
+  (void) flags;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -222,7 +277,7 @@ syscall_pidfd_open (pid_t pid, unsigned int flags)
 #else
   (void) pid;
   (void) flags;
-  errno = ENOTSUP;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -237,18 +292,55 @@ syscall_pidfd_send_signal (int pidfd, int sig, siginfo_t *info, unsigned int fla
   (void) sig;
   (void) info;
   (void) flags;
-  errno = ENOTSUP;
+  errno = ENOSYS;
   return -1;
 #endif
 }
 
 int
-libcrun_create_keyring (const char *name, libcrun_error_t *err)
+libcrun_create_keyring (const char *name, const char *label, libcrun_error_t *err)
 {
-  int ret = syscall_keyctl_join (name);
+  const char *const keycreate = "/proc/self/attr/keycreate";
+  cleanup_close int labelfd = -1;
+  bool label_set = false;
+  int ret;
+
+  if (label)
+    {
+      labelfd = open (keycreate, O_WRONLY | O_CLOEXEC);
+      if (UNLIKELY (labelfd < 0))
+        {
+          if (errno != ENOENT)
+            return crun_make_error (err, errno, "open `%s`", keycreate);
+        }
+      else
+        {
+          ret = write (labelfd, label, strlen (label));
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "write to `%s`", keycreate);
+
+          label_set = true;
+        }
+    }
+
+  ret = syscall_keyctl_join (name);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "create keyring `%s`", name);
-  return 0;
+    {
+      if (errno == ENOSYS)
+        {
+          libcrun_warning ("could not create a new keyring: keyctl_join is not supported");
+          ret = 0;
+          goto out;
+        }
+      ret = crun_make_error (err, errno, "create keyring `%s`", name);
+      goto out;
+    }
+
+out:
+  /* Best effort attempt to reset the SELinux label used for new keyrings.  */
+  if (label_set)
+    write (labelfd, "", 0);
+  return ret;
 }
 
 static void
@@ -399,6 +491,11 @@ do_remount (int targetfd, const char *target, unsigned long flags, const char *d
       real_target = target_buffer;
     }
 
+  /* Older kernels (seen on 4.18) fail with EINVAL if data is set when
+     setting MS_RDONLY.  */
+  if (flags & (MS_REMOUNT | MS_RDONLY))
+    data = NULL;
+
   ret = mount (NULL, real_target, NULL, flags, data);
   if (UNLIKELY (ret < 0))
     {
@@ -417,11 +514,11 @@ do_remount (int targetfd, const char *target, unsigned long flags, const char *d
           if (LIKELY (ret == 0))
             return 0;
 
-          /* If it still fails try to add MS_RDONLY.  */
-          if ((sfs.f_flags & MS_RDONLY) && ((flags & MS_RDONLY) == 0))
+          /* If it still fails and MS_RDONLY is present in the mount, try adding it.  */
+          if (sfs.f_flags & MS_RDONLY)
             {
               remount_flags = sfs.f_flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY);
-              ret = mount ("none", real_target, "", flags | remount_flags, data);
+              ret = mount (NULL, real_target, NULL, flags | remount_flags, data);
             }
         }
       if (UNLIKELY (ret < 0))
@@ -490,10 +587,11 @@ fsopen_mount (runtime_spec_schema_defs_mount *mount)
 
   return syscall_fsmount (fsfd, FSMOUNT_CLOEXEC, 0);
 #else
+  (void) mount;
   (void) syscall_fsopen;
   (void) syscall_fsconfig;
   (void) syscall_fsmount;
-  errno = ENOTSUP;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -502,10 +600,16 @@ static int
 fs_move_mount_to (int fd, int dirfd, const char *name)
 {
 #ifdef HAVE_FSCONFIG_CMD_CREATE
-  return syscall_move_mount (fd, "", dirfd, name, MOVE_MOUNT_F_EMPTY_PATH);
+  if (name)
+    return syscall_move_mount (fd, "", dirfd, name, MOVE_MOUNT_F_EMPTY_PATH);
+
+  return syscall_move_mount (fd, "", dirfd, "", MOVE_MOUNT_T_EMPTY_PATH | MOVE_MOUNT_F_EMPTY_PATH);
 #else
+  (void) fd;
+  (void) dirfd;
+  (void) name;
   (void) syscall_move_mount;
-  errno = ENOTSUP;
+  errno = ENOSYS;
   return -1;
 #endif
 }
@@ -521,12 +625,11 @@ enum
 };
 
 static int
-do_mount (libcrun_container_t *container, const char *source, int targetfd, const char *target, const char *fstype,
-          unsigned long mountflags, const void *data, int label_how, libcrun_error_t *err)
+do_mount (libcrun_container_t *container, const char *source, int targetfd,
+          const char *target, const char *fstype, unsigned long mountflags, const void *data,
+          int label_how, libcrun_error_t *err)
 {
   cleanup_free char *data_with_label = NULL;
-  const char *temporary_mount = NULL;
-  bool use_temporary_mount = false;
   const char *real_target = target;
   bool single_instance = false;
   bool needs_remount = false;
@@ -545,28 +648,8 @@ do_mount (libcrun_container_t *container, const char *source, int targetfd, cons
 
   if (targetfd >= 0)
     {
-      use_temporary_mount = (get_private_data (container)->unshare_flags & CLONE_NEWNS)
-                            && get_private_data (container)->tmpmountdir
-                            && (mountflags & (ALL_PROPAGATIONS | MS_BIND | MS_RDONLY));
       sprintf (target_buffer, "/proc/self/fd/%d", targetfd);
       real_target = target_buffer;
-    }
-
-  /* The temporary mount is used to solve a race condition where the mount point we created
-     on top of volumes that are accessible also from other containers.  The temporary mount
-     once configured is moved to its destination under the rootfs.  */
-  if (use_temporary_mount)
-    {
-      mode_t mode;
-
-      ret = get_file_type_fd (targetfd, &mode);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
-      if ((mode & S_IFMT) == S_IFDIR)
-        temporary_mount = get_private_data (container)->tmpmountdir;
-      else
-        temporary_mount = get_private_data (container)->tmpmountfile;
     }
 
   if (label_how == LABEL_MOUNT)
@@ -579,10 +662,9 @@ do_mount (libcrun_container_t *container, const char *source, int targetfd, cons
 
   if ((fstype && fstype[0]) || (mountflags & MS_BIND))
     {
-      const char *to = use_temporary_mount ? temporary_mount : real_target;
       unsigned long flags = mountflags & ~(ALL_PROPAGATIONS_NO_REC | MS_RDONLY);
 
-      ret = mount (source, to, fstype, flags, data);
+      ret = mount (source, real_target, fstype, flags, data);
       if (UNLIKELY (ret < 0))
         {
           int saved_errno = errno;
@@ -597,31 +679,21 @@ do_mount (libcrun_container_t *container, const char *source, int targetfd, cons
 
               if (ret > 0)
                 {
-                  ret = mount ("/sys", to, "/sys", MS_BIND | MS_REC | MS_SLAVE, data);
+                  ret = mount ("/sys", real_target, "/sys", MS_BIND | MS_REC | MS_SLAVE, data);
                   if (LIKELY (ret == 0))
                     return 0;
                 }
             }
 
-          return crun_make_error (err, saved_errno, "mount `%s` to '/%s'", source, target);
+          return crun_make_error (err, saved_errno, "mount `%s` to `/%s`", source, target);
         }
-
-      if ((flags & MS_BIND) && (flags & ~(MS_BIND | MS_RDONLY | ALL_PROPAGATIONS)))
-        needs_remount = true;
 
       if (targetfd >= 0)
         {
           /* We need to reopen the path as the previous targetfd is underneath the new mountpoint.  */
-          if (use_temporary_mount)
-            fd = open (temporary_mount, O_CLOEXEC | O_PATH);
-          else
-            fd = open_mount_target (container, target, err);
+          fd = open_mount_target (container, target, err);
           if (UNLIKELY (fd < 0))
-            {
-              if (use_temporary_mount)
-                umount (temporary_mount);
-              return fd;
-            }
+            return fd;
 
 #ifdef HAVE_FGETXATTR
           if (label_how == LABEL_XATTR)
@@ -633,17 +705,6 @@ do_mount (libcrun_container_t *container, const char *source, int targetfd, cons
               (void) setxattr (proc_file, "security.selinux", label, strlen (label), 0);
             }
 #endif
-          /* We have a fd pointing to the new mountpoint (done in a safe location).  We can move
-             the mount to the destination under the rootfs.  */
-          if (use_temporary_mount)
-            {
-              ret = mount (temporary_mount, real_target, NULL, MS_MOVE, NULL);
-              if (UNLIKELY (ret < 0))
-                {
-                  umount (temporary_mount);
-                  return crun_make_error (err, errno, "move mount to '%s'", target);
-                }
-            }
 
           targetfd = fd;
           sprintf (target_buffer, "/proc/self/fd/%d", targetfd);
@@ -664,8 +725,9 @@ do_mount (libcrun_container_t *container, const char *source, int targetfd, cons
         }
     }
 
-  if (mountflags & MS_RDONLY)
+  if (mountflags & (MS_BIND | MS_RDONLY))
     needs_remount = true;
+
   if (data && fstype && strcmp (fstype, "proc") == 0)
     {
       single_instance = true;
@@ -709,7 +771,7 @@ do_mount_cgroup_v2 (libcrun_container_t *container, int targetfd, const char *ta
   int cgroup_mode;
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
-  if (cgroup_mode < 0)
+  if (UNLIKELY (cgroup_mode < 0))
     return cgroup_mode;
 
   ret = do_mount (container, "cgroup2", targetfd, target, "cgroup2", mountflags, NULL, LABEL_NONE, err);
@@ -719,8 +781,7 @@ do_mount_cgroup_v2 (libcrun_container_t *container, int targetfd, const char *ta
         {
           crun_error_release (err);
 
-          ret = do_mount (container, "/sys/fs/cgroup", targetfd, target, NULL, MS_BIND | mountflags, NULL, LABEL_NONE,
-                          err);
+          ret = do_mount (container, CGROUP_ROOT, targetfd, target, NULL, MS_BIND | mountflags, NULL, LABEL_NONE, err);
         }
       return ret;
     }
@@ -772,7 +833,9 @@ do_mount_cgroup_systemd_v1 (libcrun_container_t *container, const char *source, 
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "open `%s`", subsystem_path);
 
-  xasprintf (&subsystem_path, "%s/%s", target, subsystem);
+  ret = append_paths (&subsystem_path, err, target, subsystem, NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   return do_mount (container, "cgroup", fd, subsystem_path, "cgroup", mountflags, "none,name=systemd,xattr", LABEL_NONE,
                    err);
@@ -783,22 +846,18 @@ do_mount_cgroup_v1 (libcrun_container_t *container, const char *source, int targ
                     unsigned long mountflags, libcrun_error_t *err)
 {
   int ret;
-  const cgroups_subsystem_t *subsystems = NULL;
   cleanup_free char *content = NULL;
   char *from;
   cleanup_close int tmpfsdirfd = -1;
   char *saveptr = NULL;
   bool has_cgroupns = false;
 
-#ifdef CLONE_NEWCGROUP
+#if CLONE_NEWCGROUP
   has_cgroupns = get_private_data (container)->unshare_flags & CLONE_NEWCGROUP;
 #endif
 
-  subsystems = libcrun_get_cgroups_subsystems (err);
-  if (UNLIKELY (subsystems == NULL))
-    return -1;
-
-  ret = do_mount (container, source, targetfd, target, "tmpfs", mountflags & ~MS_RDONLY, "size=1024k", LABEL_NONE, err);
+  ret = do_mount (container, source, targetfd, target, "tmpfs", mountflags & ~MS_RDONLY, "size=1024k", LABEL_MOUNT,
+                  err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -840,14 +899,21 @@ do_mount_cgroup_v1 (libcrun_container_t *container, const char *source, int targ
       if (strcmp (subsystem, "cpuacct,cpu") == 0)
         subsystem = "cpu,cpuacct";
 
-      xasprintf (&source_subsystem, "/sys/fs/cgroup/%s", subsystem);
+      ret = append_paths (&source_subsystem, err, CGROUP_ROOT, subsystem, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
 
       /* if there is already a mount specified, do not add a default one.  */
       if (has_mount_for (container, source_subsystem))
         continue;
 
-      xasprintf (&source_path, "%s/%s", source_subsystem, subpath);
-      xasprintf (&subsystem_path, "%s/%s", target, subsystem);
+      ret = append_paths (&source_path, err, source_subsystem, subpath, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = append_paths (&subsystem_path, err, target, subsystem, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
 
       ret = mkdirat (targetfd, subsystem, 0755);
       if (UNLIKELY (ret < 0))
@@ -887,7 +953,14 @@ do_mount_cgroup_v1 (libcrun_container_t *container, const char *source, int targ
               ret = do_mount (container, source_subsystem, subsystemfd, subsystem_path, NULL, MS_BIND | mountflags,
                               NULL, LABEL_NONE, err);
               if (UNLIKELY (ret < 0))
-                return ret;
+                {
+                  /* If it still fails with ENOENT, ignore the error as the controller might have been
+                     dropped and doesn't exist.  */
+                  if (crun_error_get_errno (err) != ENOENT)
+                    return ret;
+
+                  crun_error_release (err);
+                }
             }
         }
     }
@@ -906,7 +979,7 @@ do_mount_cgroup (libcrun_container_t *container, const char *source, int targetf
   int cgroup_mode;
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
-  if (cgroup_mode < 0)
+  if (UNLIKELY (cgroup_mode < 0))
     return cgroup_mode;
 
   switch (cgroup_mode)
@@ -963,7 +1036,6 @@ create_dev (libcrun_container_t *container, int devfd, struct device_s *device, 
   int ret;
   dev_t dev;
   mode_t type = (device->type[0] == 'b') ? S_IFBLK : ((device->type[0] == 'p') ? S_IFIFO : S_IFCHR);
-  char fd_buffer[64];
   const char *fullname = device->path;
   cleanup_close int fd = -1;
   int rootfsfd = get_private_data (container)->rootfsfd;
@@ -974,36 +1046,36 @@ create_dev (libcrun_container_t *container, int devfd, struct device_s *device, 
   if (binds)
     {
       cleanup_close int fd = -1;
-      const char *rel_path = device->path;
-
-      while (*rel_path == '/')
-        rel_path++;
 
       if (rel_dev)
         {
-          fd = openat (devfd, rel_dev, O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0700);
+          fd = openat (devfd, rel_dev, O_NOFOLLOW | O_CLOEXEC | O_PATH | O_NONBLOCK);
           if (UNLIKELY (fd < 0))
-            return crun_make_error (err, errno, "create device `%s`", device->path);
+            {
+              if (errno == ENOENT)
+                fd = openat (devfd, rel_dev, O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0700);
+
+              if (UNLIKELY (fd < 0))
+                return crun_make_error (err, errno, "create device `%s`", device->path);
+            }
         }
       else
         {
-          ret = crun_ensure_file_at (rootfsfd, rel_path, 0700, true, err);
-          if (UNLIKELY (ret < 0))
-            return ret;
+          const char *rel_path = consume_slashes (device->path);
 
-          fd = open_mount_target (container, rel_path, err);
+          fd = crun_safe_create_and_open_ref_at (false, rootfsfd, rootfs, rootfs_len, rel_path, 0700, err);
           if (UNLIKELY (fd < 0))
             return fd;
         }
 
-      sprintf (fd_buffer, "/proc/self/fd/%d", fd);
-
-      ret = do_mount (container, fullname, fd, fd_buffer, NULL, MS_BIND | MS_PRIVATE, NULL, LABEL_MOUNT, err);
+      ret = do_mount (container, fullname, fd, device->path, NULL, MS_BIND | MS_PRIVATE, NULL, LABEL_MOUNT, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
   else
     {
+      char fd_buffer[64];
+
       dev = makedev (device->major, device->minor);
 
       /* Check whether the path is directly under /dev.  Since we already have an open fd to /dev and mknodat(2)
@@ -1036,7 +1108,7 @@ create_dev (libcrun_container_t *container, int devfd, struct device_s *device, 
       else
         {
           char *dirname;
-          cleanup_free char *buffer;
+          cleanup_free char *buffer = NULL;
           cleanup_close int dirfd = -1;
           char *basename, *tmp;
 
@@ -1047,17 +1119,14 @@ create_dev (libcrun_container_t *container, int devfd, struct device_s *device, 
           *tmp = '\0';
           basename = tmp + 1;
 
-          dirfd = safe_openat (rootfsfd, rootfs, rootfs_len, dirname, O_DIRECTORY | O_PATH | O_CLOEXEC, 0, err);
+          dirfd = safe_openat (rootfsfd, rootfs, rootfs_len, dirname,
+                               O_DIRECTORY | O_PATH | O_CLOEXEC, 0, err);
           if (dirfd < 0 && ensure_parent_dir)
             {
               crun_error_release (err);
 
-              ret = crun_safe_ensure_directory_at (rootfsfd, rootfs, rootfs_len, dirname, 0755, err);
-
-              if (UNLIKELY (ret < 0))
-                return ret;
-
-              dirfd = safe_openat (rootfsfd, rootfs, rootfs_len, dirname, O_DIRECTORY | O_PATH | O_CLOEXEC, 0, err);
+              dirfd = crun_safe_create_and_open_ref_at (true, rootfsfd, rootfs,
+                                                        rootfs_len, dirname, 0755, err);
             }
           if (UNLIKELY (dirfd < 0))
             return dirfd;
@@ -1121,8 +1190,12 @@ create_missing_devs (libcrun_container_t *container, bool binds, libcrun_error_t
   for (i = 0; i < def->linux->devices_len; i++)
     {
       struct device_s device = {
-        def->linux->devices[i]->path,  def->linux->devices[i]->type,      def->linux->devices[i]->major,
-        def->linux->devices[i]->minor, def->linux->devices[i]->file_mode, def->linux->devices[i]->uid,
+        def->linux->devices[i]->path,
+        def->linux->devices[i]->type,
+        def->linux->devices[i]->major,
+        def->linux->devices[i]->minor,
+        def->linux->devices[i]->file_mode,
+        def->linux->devices[i]->uid,
         def->linux->devices[i]->gid,
       };
 
@@ -1182,9 +1255,12 @@ create_missing_devs (libcrun_container_t *container, bool binds, libcrun_error_t
 }
 
 static int
-do_masked_or_readonly_path (libcrun_container_t *container, int rootfsfd, const char *rel_path, bool readonly,
+do_masked_or_readonly_path (libcrun_container_t *container, const char *rel_path, bool readonly,
                             libcrun_error_t *err)
 {
+  size_t rootfs_len = get_private_data (container)->rootfs_len;
+  const char *rootfs = get_private_data (container)->rootfs;
+  int rootfsfd = get_private_data (container)->rootfsfd;
   cleanup_close int pathfd = -1;
   int ret;
   mode_t mode;
@@ -1192,7 +1268,7 @@ do_masked_or_readonly_path (libcrun_container_t *container, int rootfsfd, const 
   if (rel_path[0] == '/')
     rel_path++;
 
-  pathfd = openat (rootfsfd, rel_path, O_PATH | O_CLOEXEC);
+  pathfd = safe_openat (rootfsfd, rootfs, rootfs_len, rel_path, O_PATH | O_CLOEXEC, 0, err);
   if (UNLIKELY (pathfd < 0))
     {
       if (errno != ENOENT && errno != EACCES)
@@ -1219,7 +1295,7 @@ do_masked_or_readonly_path (libcrun_container_t *container, int rootfsfd, const 
         return ret;
 
       if ((mode & S_IFMT) == S_IFDIR)
-        ret = do_mount (container, "tmpfs", pathfd, rel_path, "tmpfs", MS_RDONLY, "size=0k", false, err);
+        ret = do_mount (container, "tmpfs", pathfd, rel_path, "tmpfs", MS_RDONLY, "size=0k", LABEL_MOUNT, err);
       else
         ret = do_mount (container, "/dev/null", pathfd, rel_path, NULL, MS_BIND | MS_UNBINDABLE | MS_REC, NULL,
                         LABEL_MOUNT, err);
@@ -1230,7 +1306,7 @@ do_masked_or_readonly_path (libcrun_container_t *container, int rootfsfd, const 
 }
 
 static int
-do_masked_and_readonly_paths (libcrun_container_t *container, int rootfsfd, libcrun_error_t *err)
+do_masked_and_readonly_paths (libcrun_container_t *container, libcrun_error_t *err)
 {
   size_t i;
   int ret;
@@ -1238,13 +1314,13 @@ do_masked_and_readonly_paths (libcrun_container_t *container, int rootfsfd, libc
 
   for (i = 0; i < def->linux->masked_paths_len; i++)
     {
-      ret = do_masked_or_readonly_path (container, rootfsfd, def->linux->masked_paths[i], false, err);
+      ret = do_masked_or_readonly_path (container, def->linux->masked_paths[i], false, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
   for (i = 0; i < def->linux->readonly_paths_len; i++)
     {
-      ret = do_masked_or_readonly_path (container, rootfsfd, def->linux->readonly_paths[i], true, err);
+      ret = do_masked_or_readonly_path (container, def->linux->readonly_paths[i], true, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
@@ -1290,8 +1366,7 @@ do_pivot (libcrun_container_t *container, const char *rootfs, libcrun_error_t *e
         break;
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "umount oldroot");
-    }
-  while (ret == 0);
+  } while (ret == 0);
 
   ret = chdir ("/");
   if (UNLIKELY (ret < 0))
@@ -1336,6 +1411,27 @@ get_default_flags (libcrun_container_t *container, const char *destination, char
   return 0;
 }
 
+static char *
+append_mode_if_missing (char *data, const char *mode)
+{
+  char *new_data;
+  bool append;
+
+  if (data != NULL && strstr (data, "mode="))
+    return data;
+
+  append = data != NULL && data[0] != '\0';
+
+  if (append)
+    xasprintf (&new_data, "%s,%s", data, mode);
+  else
+    new_data = xstrdup (mode);
+
+  free (data);
+
+  return new_data;
+}
+
 static int
 do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, libcrun_error_t *err)
 {
@@ -1354,20 +1450,17 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
 
   for (i = 0; i < def->mounts_len; i++)
     {
+      const char *target = consume_slashes (def->mounts[i]->destination);
       cleanup_free char *data = NULL;
       char *type;
       char *source;
       unsigned long flags = 0;
       unsigned long extra_flags = 0;
       int is_dir = 1;
-      char *target = NULL;
       cleanup_close int copy_from_fd = -1;
       cleanup_close int targetfd = -1;
       bool mounted = false;
-
-      target = def->mounts[i]->destination;
-      while (*target == '/')
-        target++;
+      bool is_sysfs_or_proc;
 
       type = def->mounts[i]->type;
 
@@ -1391,6 +1484,7 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
           /* It is used only for error messages.  */
           type = "bind";
         }
+      is_sysfs_or_proc = strcmp (type, "sysfs") == 0 || strcmp (type, "proc") == 0;
 
       if (def->mounts[i]->source && (flags & MS_BIND))
         {
@@ -1398,54 +1492,45 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
           if (UNLIKELY (is_dir < 0))
             return is_dir;
 
-          if (data == NULL || strstr (data, "mode=") == NULL)
-            {
-              bool append;
-
-              append = data != NULL && data[0] != '\0';
-
-              if (data != NULL)
-                {
-                  free (data);
-                  data = NULL;
-                }
-
-              if (append)
-                xasprintf (&data, "%s,%s", data, "mode=1755");
-              else
-                data = xstrdup ("mode=1755");
-            }
+          data = append_mode_if_missing (data, "mode=1755");
         }
 
-      if (is_dir)
+      if (is_sysfs_or_proc)
         {
-          /* Enforce /proc and /sys to be directories without any symlink under rootfs.  */
-          bool must_be_dir_under_root = strcmp (type, "sysfs") == 0 || strcmp (type, "proc") == 0;
-
-          ret = crun_safe_ensure_directory_at (rootfsfd, rootfs, rootfs_len, target, 01755, err);
+          /* Enforce sysfs and proc to be mounted on a regular directory.  */
+          ret = openat (rootfsfd, target, O_NOFOLLOW | O_DIRECTORY);
           if (UNLIKELY (ret < 0))
-            return ret;
-
-          if (must_be_dir_under_root)
             {
-              mode_t mode;
+              if (errno == ENOENT)
+                {
+                  if (strchr (target, '/'))
+                    return crun_make_error (err, 0, "invalid target `%s`: it must be mounted at the root", target);
 
-              ret = get_file_type_at (rootfsfd, &mode, true, target);
-              if (UNLIKELY (ret < 0))
-                return ret;
+                  ret = mkdirat (rootfsfd, target, 0755);
+                  if (UNLIKELY (ret < 0))
+                    return crun_make_error (err, errno, "cannot mkdir `%s`", target);
 
-              if (! S_ISDIR (mode))
-                return crun_make_error (err, ENOTDIR, "invalid target for `%s`", type);
+                  /* Try opening it again.  */
+                  ret = openat (rootfsfd, target, O_NOFOLLOW | O_DIRECTORY);
+                }
+              else if (errno == ENOTDIR)
+                return crun_make_error (err, errno, "the target `/%s` is invalid", target);
 
-              if (strchr (target, '/'))
-                return crun_make_error (err, EINVAL, "target for `%s` must be under the rootfs", type);
+              if (ret < 0)
+                return crun_make_error (err, errno, "cannot open `%s`", target);
             }
+
+          targetfd = ret;
         }
       else
         {
-          ret = crun_safe_ensure_file_at (rootfsfd, rootfs, rootfs_len, target, 0755, err);
+          /* Make sure any other directory/file is created and take a O_PATH reference to it.  */
+          ret = crun_safe_create_and_open_ref_at (is_dir, rootfsfd, rootfs, rootfs_len, target,
+                                                  is_dir ? 01755 : 0755, err);
           if (UNLIKELY (ret < 0))
             return ret;
+
+          targetfd = ret;
         }
 
       if (extra_flags & OPTION_TMPCOPYUP)
@@ -1453,11 +1538,12 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
           if (strcmp (type, "tmpfs") != 0)
             return crun_make_error (err, 0, "tmpcopyup can be used only with tmpfs");
 
-          copy_from_fd = safe_openat (rootfsfd, rootfs, rootfs_len, target, O_DIRECTORY | O_CLOEXEC, 0, err);
+          /* targetfd is opened with O_PATH, reopen the fd so it can read.  */
+          copy_from_fd = openat (targetfd, ".", O_RDONLY | O_DIRECTORY);
           if (UNLIKELY (copy_from_fd < 0))
             {
               if (errno != ENOTDIR)
-                return copy_from_fd;
+                return crun_make_error (err, errno, "cannot reopen `%s`", target);
 
               crun_error_release (err);
             }
@@ -1471,7 +1557,7 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
           {
             cleanup_close int mfd = get_and_reset (fsfd_mounts[j].fd);
 
-            ret = fs_move_mount_to (mfd, rootfsfd, target);
+            ret = fs_move_mount_to (mfd, targetfd, NULL);
             if (LIKELY (ret == 0))
               {
                 ret = do_mount (container, NULL, mfd, target, NULL, flags, data, LABEL_NONE, err);
@@ -1479,15 +1565,13 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
                   return ret;
                 mounted = true;
               }
+
             /* If the mount cannot be moved, attempt to mount it normally.  */
             break;
           }
+
       if (mounted)
         continue;
-
-      targetfd = open_mount_target (container, target, err);
-      if (UNLIKELY (targetfd < 0))
-        return targetfd;
 
       if (systemd_cgroup_v1 && strcmp (def->mounts[i]->destination, systemd_cgroup_v1) == 0)
         {
@@ -1506,7 +1590,7 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
         {
           int label_how = LABEL_MOUNT;
 
-          if (strcmp (type, "sysfs") == 0 || strcmp (type, "proc") == 0)
+          if (is_sysfs_or_proc)
             label_how = LABEL_NONE;
           else if (strcmp (type, "mqueue") == 0)
             label_how = LABEL_XATTR;
@@ -1520,7 +1604,7 @@ do_mounts (libcrun_container_t *container, int rootfsfd, const char *rootfs, lib
         {
           int destfd, tmpfd;
 
-          destfd = openat (rootfsfd, target, O_DIRECTORY);
+          destfd = safe_openat (rootfsfd, rootfs, rootfs_len, target, O_DIRECTORY, 0, err);
           if (UNLIKELY (destfd < 0))
             return crun_make_error (err, errno, "open target to write for tmpcopyup");
 
@@ -1547,6 +1631,7 @@ get_notify_fd (libcrun_context_t *context, libcrun_container_t *container, int *
   cleanup_free char *host_notify_socket_path = NULL;
   cleanup_free char *state_dir = NULL;
   char *host_path = NULL;
+  int ret;
 
   if (container && get_private_data (container)->host_notify_socket_path)
     {
@@ -1554,7 +1639,10 @@ get_notify_fd (libcrun_context_t *context, libcrun_container_t *container, int *
 
       parent_dir = get_private_data (container)->host_notify_socket_path;
 
-      xasprintf (&host_notify_socket_path, "%s/notify", parent_dir);
+      ret = append_paths (&host_notify_socket_path, err, parent_dir, "notify", NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
       host_path = host_notify_socket_path;
     }
 
@@ -1563,7 +1651,11 @@ get_notify_fd (libcrun_context_t *context, libcrun_container_t *container, int *
   if (host_path == NULL)
     {
       state_dir = libcrun_get_state_directory (context->state_root, context->id);
-      xasprintf (&host_notify_socket_path, "%s/notify/notify", state_dir);
+
+      ret = append_paths (&host_notify_socket_path, err, state_dir, "notify/notify", NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
       host_path = host_notify_socket_path;
     }
 
@@ -1603,16 +1695,53 @@ do_notify_socket (libcrun_container_t *container, const char *rootfs, libcrun_er
   cleanup_free char *host_notify_socket_path = NULL;
   cleanup_free char *container_notify_socket_path = NULL;
   cleanup_free char *state_dir = libcrun_get_state_directory (container->context->state_root, container->context->id);
+  uid_t container_root_uid = -1;
+  gid_t container_root_gid = -1;
+  int notify_socket_tree_fd;
 
   if (notify_socket == NULL)
     return 0;
 
-  xasprintf (&container_notify_socket_path, "%s%s/notify", rootfs, notify_socket);
-  xasprintf (&host_notify_socket_path, "%s/notify", state_dir);
+  ret = append_paths (&container_notify_socket_path, err, rootfs, notify_socket, "notify", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = append_paths (&host_notify_socket_path, err, state_dir, "notify", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   ret = mkdir (host_notify_socket_path, 0700);
   if (ret < 0)
     return crun_make_error (err, errno, "mkdir `%s`", host_notify_socket_path);
+
+  if (get_private_data (container)->unshare_flags & CLONE_NEWUSER)
+    {
+      get_root_in_the_userns (container->container_def, 0, 0, &container_root_uid, &container_root_gid);
+      if (container_root_uid != ((uid_t) -1) && container_root_gid != ((gid_t) -1))
+        {
+          ret = chown (host_notify_socket_path, container_root_uid, container_root_gid);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "chown %d:%d `%s`", container_root_uid, container_root_gid,
+                                    host_notify_socket_path);
+        }
+    }
+
+  notify_socket_tree_fd = syscall_open_tree (AT_FDCWD, host_notify_socket_path, OPEN_TREE_CLONE | AT_RECURSIVE);
+  if (notify_socket_tree_fd >= 0)
+    /* open_tree worked */
+    get_private_data (container)->notify_socket_tree_fd = notify_socket_tree_fd;
+  else if (errno == EPERM)
+    /* this can happen when trying to run a rootless container; this function is called
+       in the original namespace where the caller is _not_ CAP_SYS_ADMIN - in that case,
+       do nothing, because the bind mount of host_notify_socket_path directly should succeed
+       since it will be readable by the container user. */
+    ;
+  else if (errno == ENOSYS)
+    /* if open_tree(2) is not available, do nothing; we will try mount(2) in do_finalize_notify_socket */
+    ;
+  else
+    /* some other error */
+    return crun_make_error (err, errno, "open_tree `%s`", host_notify_socket_path);
 
   get_private_data (container)->host_notify_socket_path = host_notify_socket_path;
   get_private_data (container)->container_notify_socket_path = container_notify_socket_path;
@@ -1629,6 +1758,8 @@ do_finalize_notify_socket (libcrun_container_t *container, libcrun_error_t *err)
   cleanup_free char *container_notify_socket_path = get_private_data (container)->container_notify_socket_path;
   cleanup_free char *container_notify_socket_path_dir_alloc = NULL;
   char *container_notify_socket_path_dir = NULL;
+  cleanup_close int notify_socket_tree_fd = -1;
+  int did_mount_with_move_mount = 0;
 
   get_private_data (container)->host_notify_socket_path = get_private_data (container)->container_notify_socket_path
       = NULL;
@@ -1643,10 +1774,32 @@ do_finalize_notify_socket (libcrun_container_t *container, libcrun_error_t *err)
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = do_mount (container, host_notify_socket_path, -1, container_notify_socket_path_dir, NULL,
-                  MS_BIND | MS_REC | MS_PRIVATE, NULL, LABEL_MOUNT, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
+  notify_socket_tree_fd = get_private_data (container)->notify_socket_tree_fd;
+  /* the FD will be unconditionally closed at the end of this function due to cleanup_close above */
+  get_private_data (container)->notify_socket_tree_fd = -1;
+
+  if (notify_socket_tree_fd >= 0)
+    {
+      ret = syscall_move_mount (notify_socket_tree_fd, "", AT_FDCWD, container_notify_socket_path_dir,
+                                MOVE_MOUNT_F_EMPTY_PATH);
+      if (ret >= 0)
+        /* if move_mount(2) worked, make sure we don't try mount(2) */
+        did_mount_with_move_mount = 1;
+      else if (errno == ENOSYS)
+        /* do nothing; we will try mount(2) next */
+        ;
+      else
+        return crun_make_error (err, errno, "move_mount %d -> `%s`", notify_socket_tree_fd,
+                                container_notify_socket_path_dir);
+    }
+
+  if (! did_mount_with_move_mount)
+    {
+      ret = do_mount (container, host_notify_socket_path, -1, container_notify_socket_path_dir, NULL,
+                      MS_BIND | MS_REC | MS_PRIVATE, NULL, LABEL_MOUNT, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
 
   return 0;
 }
@@ -1687,106 +1840,17 @@ make_parent_mount_private (const char *rootfs, libcrun_error_t *err)
   return 0;
 }
 
-static int
-allocate_tmp_mounts (libcrun_container_t *container, char **parent_tmpdir_out, char **tmpdir_out, char **tmpfile_out,
-                     libcrun_error_t *err)
-{
-  cleanup_free char *state_dir = NULL;
-  cleanup_free char *tmpdir = NULL;
-  cleanup_free char *tmpfile = NULL;
-  char *where = NULL;
-  int ret;
-
-  state_dir = libcrun_get_state_directory (container->context->state_root, container->context->id);
-
-  where = state_dir;
-
-repeat:
-  xasprintf (&tmpdir, "%s/tmp-dir", where);
-  ret = crun_ensure_directory (tmpdir, 0700, true, err);
-  if (UNLIKELY (ret < 0))
-    {
-      /*If the current user has no access to the state directory (e.g. running in an
-        user namespace), then try with a temporary directory.  */
-      if (crun_error_get_errno (err) == EPERM || crun_error_get_errno (err) == EROFS
-          || crun_error_get_errno (err) == EACCES)
-        {
-          char tmp_dir[32];
-          char *d;
-
-          if (*parent_tmpdir_out == NULL)
-            {
-              strcpy (tmp_dir, "/tmp/libcrun.XXXXXX");
-              d = mkdtemp (tmp_dir);
-              if (d)
-                {
-                  crun_error_release (err);
-                  *parent_tmpdir_out = xstrdup (d);
-                  where = *parent_tmpdir_out;
-                  goto repeat;
-                }
-            }
-
-          return ret;
-        }
-
-      return ret;
-    }
-
-  xasprintf (&tmpfile, "%s/tmp-file", where);
-  ret = crun_ensure_file (tmpfile, 0700, true, err);
-  if (UNLIKELY (ret < 0))
-    {
-      rmdir (tmpdir);
-      return ret;
-    }
-
-  *tmpdir_out = tmpdir;
-  *tmpfile_out = tmpfile;
-  tmpdir = tmpfile = NULL;
-  return 0;
-}
-
-static int
-cleanup_rmdir (void *p)
-{
-  int ret;
-  char **pp = (char **) p;
-  if (*pp)
-    {
-      cleanup_dir DIR *d = NULL;
-      struct dirent *de;
-      cleanup_close int dfd = open (*pp, O_DIRECTORY | O_RDONLY);
-      if (dfd < 0)
-        goto exit;
-      d = fdopendir (dfd);
-      if (d == NULL)
-        goto exit;
-
-      for (de = readdir (d); de; de = readdir (d))
-        {
-          if (strcmp (de->d_name, ".") == 0 || strcmp (de->d_name, "..") == 0)
-            continue;
-          ret = unlinkat (dirfd (d), de->d_name, 0);
-          if (ret < 0)
-            unlinkat (dirfd (d), de->d_name, AT_REMOVEDIR);
-        }
-      unlinkat (AT_FDCWD, *pp, AT_REMOVEDIR);
-    }
-exit:
-  free (*pp);
-  return 0;
-}
-
 int
-libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_error_t *err)
+libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, set_mounts_cb_t cb, void *cb_data, libcrun_error_t *err)
 {
-  runtime_spec_schema_config_schema *def = container->container_def;
+  int rootfsfd = -1;
   int ret = 0, is_user_ns = 0;
   unsigned long rootfs_propagation = 0;
   cleanup_close int rootfsfd_cleanup = -1;
-  __attribute__ ((cleanup (cleanup_rmdir))) char *tmpdirparent = NULL;
-  int rootfsfd = -1;
+  runtime_spec_schema_config_schema *def = container->container_def;
+
+  if (rootfs == NULL || def->mounts == NULL)
+    return 0;
 
   if (def->linux->rootfs_propagation)
     rootfs_propagation = get_mount_flags (def->linux->rootfs_propagation, 0, NULL, NULL);
@@ -1798,16 +1862,6 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
 
   if (get_private_data (container)->unshare_flags & CLONE_NEWNS)
     {
-      char *tmpdir = NULL;
-      char *tmpfile = NULL;
-
-      ret = allocate_tmp_mounts (container, &tmpdirparent, &tmpdir, &tmpfile, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
-      get_private_data (container)->tmpmountdir = tmpdir;
-      get_private_data (container)->tmpmountfile = tmpfile;
-
       ret = do_mount (container, NULL, -1, "/", NULL, rootfs_propagation, NULL, LABEL_MOUNT, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -1816,15 +1870,9 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
       if (UNLIKELY (ret < 0))
         return ret;
 
-      ret = make_parent_mount_private (tmpdirparent ? tmpdirparent : tmpdir, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
       ret = do_mount (container, rootfs, -1, rootfs, NULL, MS_BIND | MS_REC | MS_PRIVATE, NULL, LABEL_MOUNT, err);
       if (UNLIKELY (ret < 0))
         return ret;
-
-      do_mount (container, NULL, -1, "/tmp", NULL, MS_PRIVATE, NULL, LABEL_MOUNT, err);
     }
 
   if (rootfs == NULL)
@@ -1844,8 +1892,9 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
     {
       struct remount_s *r;
       unsigned long remount_flags = MS_REMOUNT | MS_BIND | MS_RDONLY;
-      int fd = dup (rootfsfd);
+      int fd;
 
+      fd = dup (rootfsfd);
       if (UNLIKELY (fd < 0))
         return crun_make_error (err, errno, "dup fd for `%s`", rootfs);
 
@@ -1876,11 +1925,19 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
         return ret;
     }
 
+  /* Notify the callback after all the mounts are ready but before making them read-only.  */
+  if (cb)
+    {
+      ret = cb (cb_data, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
   ret = do_finalize_notify_socket (container, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = do_masked_and_readonly_paths (container, rootfsfd, err);
+  ret = do_masked_and_readonly_paths (container, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -1888,24 +1945,6 @@ libcrun_set_mounts (libcrun_container_t *container, const char *rootfs, libcrun_
   if (UNLIKELY (ret < 0))
     return ret;
 
-  if (get_private_data (container)->tmpmountdir)
-    {
-      rmdir (get_private_data (container)->tmpmountdir);
-      free (get_private_data (container)->tmpmountdir);
-      get_private_data (container)->tmpmountdir = NULL;
-    }
-  if (get_private_data (container)->tmpmountfile)
-    {
-      unlink (get_private_data (container)->tmpmountfile);
-      free (get_private_data (container)->tmpmountfile);
-      get_private_data (container)->tmpmountfile = NULL;
-    }
-  if (tmpdirparent)
-    {
-      rmdir (tmpdirparent);
-      free (tmpdirparent);
-      tmpdirparent = NULL;
-    }
   get_private_data (container)->rootfsfd = -1;
 
   return 0;
@@ -2091,18 +2130,19 @@ can_setgroups (libcrun_container_t *container, libcrun_error_t *err)
 }
 
 int
-libcrun_container_setgroups (libcrun_container_t *container, libcrun_error_t *err)
+libcrun_container_setgroups (libcrun_container_t *container,
+                             runtime_spec_schema_config_schema_process *process,
+                             libcrun_error_t *err)
 {
-  runtime_spec_schema_config_schema *def = container->container_def;
   gid_t *additional_gids = NULL;
   size_t additional_gids_len = 0;
   int can_do_setgroups;
   int ret;
 
-  if (def->process != NULL && def->process->user != NULL)
+  if (process != NULL && process->user != NULL)
     {
-      additional_gids = def->process->user->additional_gids;
-      additional_gids_len = def->process->user->additional_gids_len;
+      additional_gids = process->user->additional_gids;
+      additional_gids_len = process->user->additional_gids_len;
     }
 
   can_do_setgroups = can_setgroups (container, err);
@@ -2122,7 +2162,7 @@ libcrun_container_setgroups (libcrun_container_t *container, libcrun_error_t *er
 int
 libcrun_container_enter_cgroup_ns (libcrun_container_t *container, libcrun_error_t *err)
 {
-#ifdef CLONE_NEWCGROUP
+#if CLONE_NEWCGROUP
   if (get_private_data (container)->unshare_flags & CLONE_NEWCGROUP)
     {
       int ret = unshare (CLONE_NEWCGROUP);
@@ -2146,7 +2186,7 @@ libcrun_set_usernamespace (libcrun_container_t *container, pid_t pid, libcrun_er
   cleanup_free char *uid_map = NULL;
   cleanup_free char *gid_map = NULL;
   int uid_map_len, gid_map_len;
-  int ret;
+  int ret = 0;
   runtime_spec_schema_config_schema *def = container->container_def;
 
   if ((get_private_data (container)->unshare_flags & CLONE_NEWUSER) == 0)
@@ -2214,7 +2254,12 @@ libcrun_set_usernamespace (libcrun_container_t *container, pid_t pid, libcrun_er
     ret = newgidmap (pid, gid_map, err);
   if (container->host_uid == 0 || ret < 0)
     {
-      crun_error_release (err);
+      if (ret < 0)
+        {
+          if (! def->linux->uid_mappings_len)
+            libcrun_warning ("unable to invoke newgidmap, will try creating a user namespace with single mapping as an alternative");
+          crun_error_release (err);
+        }
 
       xasprintf (&gid_map_file, "/proc/%d/gid_map", pid);
       ret = write_file (gid_map_file, gid_map, gid_map_len, err);
@@ -2239,7 +2284,12 @@ libcrun_set_usernamespace (libcrun_container_t *container, pid_t pid, libcrun_er
     ret = newuidmap (pid, uid_map, err);
   if (container->host_uid == 0 || ret < 0)
     {
-      crun_error_release (err);
+      if (ret < 0)
+        {
+          if (! def->linux->uid_mappings_len)
+            libcrun_warning ("unable to invoke newuidmap, will try creating a user namespace with single mapping as an alternative");
+          crun_error_release (err);
+        }
 
       xasprintf (&uid_map_file, "/proc/%d/uid_map", pid);
       ret = write_file (uid_map_file, uid_map, uid_map_len, err);
@@ -2313,6 +2363,7 @@ libcrun_init_caps (libcrun_error_t *err)
 static int
 set_required_caps (struct all_caps_s *caps, uid_t uid, gid_t gid, int no_new_privs, libcrun_error_t *err)
 {
+#ifdef HAVE_CAP
   unsigned long cap;
   int ret;
   struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
@@ -2340,19 +2391,19 @@ set_required_caps (struct all_caps_s *caps, uid_t uid, gid_t gid, int no_new_pri
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "error while setting PR_SET_KEEPCAPS");
 
-  ret = setgid (gid);
+  ret = setresgid (gid, gid, gid);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "cannot setgid");
+    return crun_make_error (err, errno, "cannot setresgid to %d", gid);
 
-  ret = setuid (uid);
+  ret = setresuid (uid, uid, uid);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "cannot setuid");
+    return crun_make_error (err, errno, "cannot setresuid to %d", uid);
 
   ret = capset (&hdr, data);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "capset");
 
-#ifdef PR_CAP_AMBIENT
+#  ifdef PR_CAP_AMBIENT
   ret = prctl (PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
   if (UNLIKELY (ret < 0 && ! (errno == EINVAL || errno == EPERM)))
     return crun_make_error (err, errno, "prctl reset ambient");
@@ -2364,6 +2415,7 @@ set_required_caps (struct all_caps_s *caps, uid_t uid, gid_t gid, int no_new_pri
         if (UNLIKELY (ret < 0 && ! (errno == EINVAL || errno == EPERM)))
           return crun_make_error (err, errno, "prctl ambient raise");
       }
+#  endif
 #endif
 
   if (no_new_privs)
@@ -2374,19 +2426,27 @@ set_required_caps (struct all_caps_s *caps, uid_t uid, gid_t gid, int no_new_pri
 }
 
 static int
-read_caps (unsigned long caps[2], char **values, size_t len, libcrun_error_t *err)
+read_caps (unsigned long caps[2], char **values, size_t len)
 {
+#ifdef HAVE_CAP
   size_t i;
   for (i = 0; i < len; i++)
     {
       cap_value_t cap;
       if (cap_from_name (values[i], &cap) < 0)
-        return crun_make_error (err, 0, "unknown cap: `%s`", values[i]);
+        {
+          libcrun_warning ("unknown cap: `%s`", values[i]);
+          continue;
+        }
       if (cap < 32)
         caps[0] |= CAP_TO_MASK_0 (cap);
       else
         caps[1] |= CAP_TO_MASK_1 (cap);
     }
+#else
+  caps[0] = 0;
+  caps[1] = 0;
+#endif
   return 0;
 }
 
@@ -2411,32 +2471,16 @@ int
 libcrun_set_caps (runtime_spec_schema_config_schema_process_capabilities *capabilities, uid_t uid, gid_t gid,
                   int no_new_privileges, libcrun_error_t *err)
 {
-  int ret;
   struct all_caps_s caps = {};
 
   if (capabilities)
     {
-      ret = read_caps (caps.effective, capabilities->effective, capabilities->effective_len, err);
-      if (ret < 0)
-        return ret;
-
-      ret = read_caps (caps.inheritable, capabilities->inheritable, capabilities->inheritable_len, err);
-      if (ret < 0)
-        return ret;
-
-      ret = read_caps (caps.ambient, capabilities->ambient, capabilities->ambient_len, err);
-      if (ret < 0)
-        return ret;
-
-      ret = read_caps (caps.bounding, capabilities->bounding, capabilities->bounding_len, err);
-      if (ret < 0)
-        return ret;
-
-      ret = read_caps (caps.permitted, capabilities->permitted, capabilities->permitted_len, err);
-      if (ret < 0)
-        return ret;
+      read_caps (caps.effective, capabilities->effective, capabilities->effective_len);
+      read_caps (caps.inheritable, capabilities->inheritable, capabilities->inheritable_len);
+      read_caps (caps.ambient, capabilities->ambient, capabilities->ambient_len);
+      read_caps (caps.bounding, capabilities->bounding, capabilities->bounding_len);
+      read_caps (caps.permitted, capabilities->permitted, capabilities->permitted_len);
     }
-
   return set_required_caps (&caps, uid, gid, no_new_privileges, err);
 }
 
@@ -2569,6 +2613,18 @@ libcrun_set_sysctl (libcrun_container_t *container, libcrun_error_t *err)
   return libcrun_set_sysctl_from_schema (container->container_def, err);
 }
 
+static uid_t
+get_uid_for_intermediate_userns (libcrun_container_t *container)
+{
+  if (container->use_intermediate_userns)
+    return 0;
+
+  if (container->container_def->process && container->container_def->process->user)
+    return container->container_def->process->user->uid;
+
+  return 0;
+}
+
 static int
 open_terminal (libcrun_container_t *container, char **pty, libcrun_error_t *err)
 {
@@ -2586,7 +2642,9 @@ open_terminal (libcrun_container_t *container, char **pty, libcrun_error_t *err)
   if (container->container_def->process && container->container_def->process->user
       && container->container_def->process->user->uid)
     {
-      ret = chown (*pty, container->container_def->process->user->uid, -1);
+      uid_t uid = get_uid_for_intermediate_userns (container);
+
+      ret = chown (*pty, uid, -1);
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "chown `%s`", *pty);
     }
@@ -2633,7 +2691,8 @@ save_external_descriptors (libcrun_container_t *container, pid_t pid, libcrun_er
               return crun_make_error (err, errno, "readlink");
             }
         }
-      link_path[ret] = 0;
+      else
+        link_path[ret] = 0;
       yajl_gen_string (gen, YAJL_STR (link_path), strlen (link_path));
     }
 
@@ -2829,7 +2888,7 @@ join_namespaces (runtime_spec_schema_config_schema *def, int *namespaces_to_join
 
       if (value == CLONE_NEWNS)
         {
-          cwd = get_current_dir_name ();
+          cwd = getcwd (NULL, 0);
           if (UNLIKELY (cwd == NULL))
             return crun_make_error (err, errno, "cannot get current working directory");
         }
@@ -2887,6 +2946,14 @@ struct init_status_s
 
   /* What namespaces are still missing to be created.  */
   int namespaces_to_unshare;
+
+  /* Index in fd[] for the pidns that must be joined before any
+     other namespace.  */
+  int idx_pidns_to_join_immediately;
+
+  /* Index in fd[] for the timens that must be joined before any
+     other namespace.  */
+  int idx_timens_to_join_immediately;
 };
 
 void
@@ -2916,6 +2983,8 @@ configure_init_status (struct init_status_s *ns, libcrun_container_t *container,
   ns->delayed_userns_create = false;
   ns->userns_index = -1;
   ns->userns_index_origin = -1;
+  ns->idx_pidns_to_join_immediately = -1;
+  ns->idx_timens_to_join_immediately = -1;
 
   for (i = 0; i < def->linux->namespaces_len; i++)
     {
@@ -2956,7 +3025,63 @@ configure_init_status (struct init_status_s *ns, libcrun_container_t *container,
     {
       libcrun_warning ("non root user need to have an 'user' namespace");
       ns->all_namespaces |= CLONE_NEWUSER;
+      ns->namespaces_to_unshare |= CLONE_NEWUSER;
     }
+
+  return 0;
+}
+
+/* Detect if root is available in the container.  */
+static bool
+root_mapped_in_container_p (runtime_spec_schema_defs_id_mapping **mappings, size_t len)
+{
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    if (mappings[i]->container_id == 0)
+      return true;
+
+  return false;
+}
+
+static int
+set_id_init (libcrun_container_t *container, libcrun_error_t *err)
+{
+  runtime_spec_schema_config_schema *def = container->container_def;
+  uid_t uid = 0;
+  gid_t gid = 0;
+  int ret;
+
+  if (def->process && def->process->user && def->linux)
+    {
+      /*
+        If it is running in a user namespace and root is not mapped
+        use the UID/GID specified for running the container.
+      */
+      bool root_mapped = false;
+
+      if (def->linux->uid_mappings_len != 0)
+        {
+          root_mapped = root_mapped_in_container_p (def->linux->uid_mappings, def->linux->uid_mappings_len);
+          if (! root_mapped)
+            uid = def->process->user->uid;
+        }
+
+      if (def->linux->gid_mappings_len != 0)
+        {
+          root_mapped = root_mapped_in_container_p (def->linux->gid_mappings, def->linux->gid_mappings_len);
+          if (! root_mapped)
+            gid = def->process->user->gid;
+        }
+    }
+
+  ret = setresuid (uid, uid, uid);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "setresuid to %d", uid);
+
+  ret = setresgid (gid, gid, gid);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "setresgid to %d", gid);
 
   return 0;
 }
@@ -2973,6 +3098,52 @@ init_container (libcrun_container_t *container, int sync_socket_container, struc
   int ret;
   const char success = 0;
 
+  if (init_status->idx_pidns_to_join_immediately >= 0 || init_status->idx_timens_to_join_immediately >= 0)
+    {
+      pid_t new_pid;
+
+      if (init_status->idx_pidns_to_join_immediately >= 0)
+        {
+          ret = setns (init_status->fd[init_status->idx_pidns_to_join_immediately], CLONE_NEWPID);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "cannot setns to target pidns");
+
+          close_and_reset (&init_status->fd[init_status->idx_pidns_to_join_immediately]);
+        }
+
+      if (init_status->idx_timens_to_join_immediately >= 0)
+        {
+          ret = setns (init_status->fd[init_status->idx_timens_to_join_immediately], CLONE_NEWTIME);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "cannot setns to target timens");
+
+          close_and_reset (&init_status->fd[init_status->idx_timens_to_join_immediately]);
+        }
+
+      new_pid = fork ();
+      if (UNLIKELY (new_pid < 0))
+        return crun_make_error (err, errno, "fork");
+
+      if (new_pid)
+        {
+          /* Report the new PID to the parent and exit immediately.  */
+          ret = TEMP_FAILURE_RETRY (write (sync_socket_container, &success, 1));
+          if (UNLIKELY (ret < 0))
+            kill (new_pid, SIGKILL);
+
+          ret = TEMP_FAILURE_RETRY (write (sync_socket_container, &new_pid, sizeof (new_pid)));
+          if (UNLIKELY (ret < 0))
+            kill (new_pid, SIGKILL);
+
+          _exit (0);
+        }
+
+      /* In the new processs.  Wait for the parent to receive the new PID.  */
+      ret = expect_success_from_sync_socket (sync_socket_container, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
   ret = libcrun_set_oom (container, err);
   if (UNLIKELY (ret < 0))
     return ret;
@@ -2982,22 +3153,22 @@ init_container (libcrun_container_t *container, int sync_socket_container, struc
       ret = join_namespaces (def, init_status->fd, init_status->fd_len, init_status->index, true, err);
       if (UNLIKELY (ret < 0))
         return ret;
+    }
 
-      /* If the container needs to join an existing PID namespace, take a reference to it
-         before creating a new user namespace, as we could lose the access to the existing
-         namespace.  */
-      if ((init_status->all_namespaces & CLONE_NEWUSER) && (init_status->join_pidns || init_status->join_ipcns))
+  /* If the container needs to join an existing PID namespace, take a reference to it
+     before creating a new user namespace, as we could lose the access to the existing
+     namespace.  */
+  if ((init_status->all_namespaces & CLONE_NEWUSER) && (init_status->join_pidns || init_status->join_ipcns))
+    {
+      for (i = 0; i < def->mounts_len; i++)
         {
-          for (i = 0; i < def->mounts_len; i++)
-            {
-              /* If for any reason the mount cannot be opened, ignore errors and continue.
-                 An error will be generated later if it is not possible to join the namespace.
-              */
-              if (init_status->join_pidns && strcmp (def->mounts[i]->type, "proc") == 0)
-                procfsfd = fsopen_mount (def->mounts[i]);
-              if (init_status->join_ipcns && strcmp (def->mounts[i]->type, "mqueue") == 0)
-                mqueuefsfd = fsopen_mount (def->mounts[i]);
-            }
+          /* If for any reason the mount cannot be opened, ignore errors and continue.
+             An error will be generated later if it is not possible to join the namespace.
+          */
+          if (init_status->join_pidns && strcmp (def->mounts[i]->type, "proc") == 0)
+            procfsfd = fsopen_mount (def->mounts[i]);
+          if (init_status->join_ipcns && strcmp (def->mounts[i]->type, "mqueue") == 0)
+            mqueuefsfd = fsopen_mount (def->mounts[i]);
         }
     }
 
@@ -3033,28 +3204,23 @@ init_container (libcrun_container_t *container, int sync_socket_container, struc
                                     def->linux->namespaces[init_status->userns_index_origin]->path);
         }
 
-      ret = setresuid (0, 0, 0);
+      ret = set_id_init (container, err);
       if (UNLIKELY (ret < 0))
-        return crun_make_error (err, errno, "setresuid(0)");
-
-      ret = setresgid (0, 0, 0);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, errno, "setresgid(0)");
+        return ret;
     }
 
   ret = join_namespaces (def, init_status->fd, init_status->fd_len, init_status->index, false, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  if (init_status->namespaces_to_unshare)
+  if (init_status->namespaces_to_unshare & ~CLONE_NEWCGROUP)
     {
       /* New namespaces to create for the container.  */
-      ret = unshare (init_status->namespaces_to_unshare);
+      ret = unshare (init_status->namespaces_to_unshare & ~CLONE_NEWCGROUP);
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "unshare");
     }
 
-#ifdef CLONE_NEWTIME
   if (init_status->all_namespaces & CLONE_NEWTIME)
     {
       const char *v = find_annotation (container, "run.oci.timens_offset");
@@ -3065,11 +3231,10 @@ init_container (libcrun_container_t *container, int sync_socket_container, struc
             return ret;
         }
     }
-#endif
 
   if (init_status->must_fork)
     {
-      /* A PID and a time namespace is joined when a new process is created.  */
+      /* A PID and a time namespace are joined when the new process is created.  */
       pid_container = fork ();
       if (UNLIKELY (pid_container < 0))
         return crun_make_error (err, errno, "cannot fork");
@@ -3093,7 +3258,7 @@ init_container (libcrun_container_t *container, int sync_socket_container, struc
         return ret;
     }
 
-  ret = libcrun_container_setgroups (container, err);
+  ret = libcrun_container_setgroups (container, container->container_def->process, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -3112,7 +3277,8 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
   cleanup_close int sync_socket_container = -1;
   char *notify_socket_env = NULL;
   cleanup_close int sync_socket_host = -1;
-  bool clone_can_create_userns;
+  __attribute__ ((unused)) cleanup_close int restore_pidns = -1;
+  int first_clone_args = 0;
   const char failure = 1;
   const char success = 0;
   int sync_socket[2];
@@ -3125,7 +3291,7 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
     return ret;
 
   get_private_data (container)->unshare_flags = init_status.all_namespaces;
-#ifdef CLONE_NEWCGROUP
+#if CLONE_NEWCGROUP
   /* cgroup will be unshared later.  Once the process is in the correct cgroup.  */
   init_status.all_namespaces &= ~CLONE_NEWCGROUP;
 #endif
@@ -3138,9 +3304,12 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
   sync_socket_container = sync_socket[1];
 
 #ifdef HAVE_SYSTEMD
-  ret = do_notify_socket (container, def->root->path, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
+  if (def->root)
+    {
+      ret = do_notify_socket (container, def->root->path, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
 #endif
 
   get_uid_gid_from_def (container->container_def, &container->container_uid, &container->container_gid);
@@ -3157,63 +3326,72 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
   if (UNLIKELY (ret < 0))
     return ret;
 
-  if ((init_status.all_namespaces & CLONE_NEWIPC) && (init_status.all_namespaces & CLONE_NEWUSER))
-    {
-      for (i = 0; i < init_status.fd_len; i++)
-        if (init_status.value[i] == CLONE_NEWIPC)
-          init_status.join_ipcns = true;
-    }
+  /* If a new user namespace must be created, but there are other namespaces to join, then delay
+     the userns creation after the namespaces are joined.  */
+  init_status.delayed_userns_create
+      = (init_status.all_namespaces & CLONE_NEWUSER) && init_status.userns_index < 0 && init_status.fd_len > 0;
 
-  if (init_status.all_namespaces & CLONE_NEWPID)
+  /* Check if special handling is required to join the namespaces.  */
+  for (i = 0; i < init_status.fd_len; i++)
     {
-      init_status.must_fork = true;
-      for (i = 0; i < init_status.fd_len; i++)
+      switch (init_status.value[i])
         {
-          if (init_status.value[i] == CLONE_NEWPID)
+        case CLONE_NEWIPC:
+          if (init_status.all_namespaces & CLONE_NEWUSER)
+            init_status.join_ipcns = true;
+          break;
+
+        case CLONE_NEWPID:
+          if ((init_status.all_namespaces & CLONE_NEWUSER) == 0)
+            init_status.must_fork = true;
+          else
             {
               init_status.join_pidns = true;
-              if (setns (init_status.fd[i], CLONE_NEWPID) == 0)
-                {
-                  init_status.namespaces_to_unshare &= ~CLONE_NEWPID;
-                  init_status.must_fork = false;
-                  close_and_reset (&init_status.fd[i]);
-                }
-              break;
-            }
-        }
-      /* It creates a new PID namespace, without a user namespace, we can try to
-         join it immediately without another fork.  */
-      if (i == init_status.fd_len && (init_status.all_namespaces & CLONE_NEWUSER) == 0)
-        {
-          if (unshare (CLONE_NEWPID) == 0)
-            {
+              init_status.idx_pidns_to_join_immediately = i;
               init_status.namespaces_to_unshare &= ~CLONE_NEWPID;
-              init_status.must_fork = false;
             }
+          break;
+
+        case CLONE_NEWTIME:
+          if ((init_status.all_namespaces & CLONE_NEWUSER) == 0)
+            init_status.must_fork = true;
+          else
+            {
+              init_status.idx_timens_to_join_immediately = i;
+              init_status.namespaces_to_unshare &= ~CLONE_NEWTIME;
+            }
+          break;
         }
     }
-#ifdef CLONE_NEWTIME
-  if (init_status.all_namespaces & CLONE_NEWTIME)
-    init_status.must_fork = true;
-#endif
 
-  /* If there are no other namespaces to join, we can create the user ns directly with clone(2).  */
-  clone_can_create_userns = init_status.fd_len == 0;
+  /* Before attempting any setns() or unshare(), a clone() is required to not touch the caller context
+     that can be used later on for running hooks.  */
 
-  if ((init_status.all_namespaces & CLONE_NEWUSER) && init_status.userns_index < 0)
-    init_status.delayed_userns_create = ! clone_can_create_userns || init_status.fd_len > 0;
+  if ((init_status.namespaces_to_unshare & CLONE_NEWUSER) && init_status.fd_len == 0)
+    {
+      /* If a user namespace must be created and there are no other namespaces to join, create the userns alone.  */
+      first_clone_args = CLONE_NEWUSER;
+    }
+  else if ((init_status.all_namespaces & CLONE_NEWUSER) == 0)
+    {
+      /* If it doesn't create a user namespace or need to join one, create the new requested namespaces now. */
+      first_clone_args = init_status.namespaces_to_unshare & ~(CLONE_NEWTIME | CLONE_NEWCGROUP);
+    }
 
-  /* If we create a new user namespace, create it as part of the clone.  */
-  pid = syscall_clone ((init_status.namespaces_to_unshare & (clone_can_create_userns ? CLONE_NEWUSER : 0)) | SIGCHLD,
-                       NULL);
+  pid = syscall_clone (first_clone_args | SIGCHLD, NULL);
   if (UNLIKELY (pid < 0))
     return crun_make_error (err, errno, "clone");
 
-  if (clone_can_create_userns)
-    init_status.namespaces_to_unshare &= ~CLONE_NEWUSER;
+  init_status.namespaces_to_unshare &= ~first_clone_args;
+
+  /* Check if there are still namespaces that require a fork().  */
+  if (init_status.namespaces_to_unshare & (CLONE_NEWPID | CLONE_NEWTIME))
+    init_status.must_fork = true;
 
   if (pid)
     {
+      cleanup_pid pid_t pid_to_clean = pid;
+
       ret = save_external_descriptors (container, pid, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -3222,25 +3400,47 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "close");
 
-      if (init_status.all_namespaces & CLONE_NEWUSER)
+      /* any systemd notify socket open_tree FD is pointless to keep around in the parent */
+      close_and_reset (&(get_private_data (container)->notify_socket_tree_fd));
+
+      if (init_status.idx_pidns_to_join_immediately >= 0 || init_status.idx_timens_to_join_immediately >= 0)
         {
-          if (init_status.delayed_userns_create)
-            {
-              ret = expect_success_from_sync_socket (sync_socket_host, err);
-              if (UNLIKELY (ret < 0))
-                return ret;
-            }
+          pid_t new_pid = 0;
 
-          if (init_status.userns_index < 0)
-            {
-              ret = libcrun_set_usernamespace (container, pid, err);
-              if (UNLIKELY (ret < 0))
-                return ret;
+          ret = expect_success_from_sync_socket (sync_socket_host, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
 
-              ret = TEMP_FAILURE_RETRY (write (sync_socket_host, "1", 1));
-              if (UNLIKELY (ret < 0))
-                return crun_make_error (err, errno, "write to sync socket");
-            }
+          ret = TEMP_FAILURE_RETRY (read (sync_socket_host, &new_pid, sizeof (new_pid)));
+          if (UNLIKELY (ret != sizeof (new_pid)))
+            return crun_make_error (err, errno, "read pid from sync socket");
+
+          /* Cleanup the first process.  */
+          ret = TEMP_FAILURE_RETRY (waitpid (pid, NULL, 0));
+
+          pid_to_clean = pid = new_pid;
+
+          ret = TEMP_FAILURE_RETRY (write (sync_socket_host, &success, 1));
+          if (UNLIKELY (ret < 0))
+            return ret;
+        }
+
+      if (init_status.delayed_userns_create)
+        {
+          ret = expect_success_from_sync_socket (sync_socket_host, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+        }
+
+      if ((init_status.all_namespaces & CLONE_NEWUSER) && init_status.userns_index < 0)
+        {
+          ret = libcrun_set_usernamespace (container, pid, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+
+          ret = TEMP_FAILURE_RETRY (write (sync_socket_host, "1", 1));
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "write to sync socket");
         }
 
       if (init_status.must_fork)
@@ -3262,7 +3462,7 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
           /* Cleanup the first process.  */
           waitpid (pid, NULL, 0);
 
-          pid = grandchild;
+          pid_to_clean = pid = grandchild;
         }
 
       ret = expect_success_from_sync_socket (sync_socket_host, err);
@@ -3271,6 +3471,7 @@ libcrun_run_linux_container (libcrun_container_t *container, container_entrypoin
 
       *sync_socket_out = get_and_reset (&sync_socket_host);
 
+      pid_to_clean = 0;
       return pid;
     }
 
@@ -3423,7 +3624,8 @@ libcrun_join_process (libcrun_container_t *container, pid_t pid_to_join, libcrun
 
   for (i = 0; namespaces[i].ns_file; i++)
     {
-      cleanup_free char *ns_join;
+      cleanup_free char *ns_join = NULL;
+
       xasprintf (&ns_join, "/proc/%d/ns/%s", pid_to_join, namespaces[i].ns_file);
       fds[i] = open (ns_join, O_RDONLY);
       if (UNLIKELY (fds[i] < 0))
@@ -3533,19 +3735,9 @@ libcrun_join_process (libcrun_container_t *container, pid_t pid_to_join, libcrun
               send_error_to_sync_socket_and_die (sync_fd, true, err);
             }
 
-          ret = setresuid (0, 0, 0);
+          ret = set_id_init (container, err);
           if (UNLIKELY (ret < 0))
-            {
-              crun_make_error (err, errno, "setgid");
-              send_error_to_sync_socket_and_die (sync_fd, true, err);
-            }
-
-          ret = setresgid (0, 0, 0);
-          if (UNLIKELY (ret < 0))
-            {
-              crun_make_error (err, errno, "setuid");
-              send_error_to_sync_socket_and_die (sync_fd, true, err);
-            }
+            send_error_to_sync_socket_and_die (sync_fd, true, err);
 
           ptmx_fd = open_terminal (container, &pty, err);
           if (UNLIKELY (ptmx_fd < 0))
@@ -3585,7 +3777,7 @@ libcrun_linux_container_update (libcrun_container_status_t *status, const char *
   int cgroup_mode;
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
-  if (cgroup_mode < 0)
+  if (UNLIKELY (cgroup_mode < 0))
     return cgroup_mode;
 
   ret = parse_json_file (&tree, content, &ctx, err);
@@ -3729,7 +3921,7 @@ libcrun_kill_linux (libcrun_container_status_t *status, int signal, libcrun_erro
   if (UNLIKELY (pidfd < 0))
     {
       /* If pidfd_open is not supported, fallback to kill.  */
-      if (errno == ENOTSUP)
+      if (errno == ENOSYS)
         {
           ret = kill (status->pid, signal);
           if (UNLIKELY (ret < 0))
@@ -3753,6 +3945,118 @@ libcrun_kill_linux (libcrun_container_status_t *status, int signal, libcrun_erro
   ret = syscall_pidfd_send_signal (pidfd, signal, NULL, 0);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "send signal to pidfd");
+
+  return 0;
+}
+
+/*
+   Used when creating an intermediate user namespace.
+   If the container is running with a single UID/GID mapped, and specifies
+   a different UID/GID, then create an intermediate user namespace to do
+   all the configuration as root, and then once the container is set up,
+   create a new user namespace to map root to the desired UID/GID.
+   This implementation has some issues as some namespaces in the container
+   won't be owned by the final user namespace and it creates a process inside
+   the container PID namespace, so the next created process won't have pid=2.
+   Some of these issues could be solved or at least mitigated, but it is not worth
+   at the moment to add more complexity to address these corner cases.
+*/
+int
+libcrun_create_final_userns (libcrun_container_t *container, libcrun_error_t *err)
+{
+  runtime_spec_schema_config_schema *def = container->container_def;
+  cleanup_close int closep0 = -1;
+  cleanup_close int closep1 = -1;
+  int pid_status;
+  pid_t pid, target_pid;
+  int to_unshare;
+  size_t i;
+  int p[2];
+  int ret;
+
+  ret = pipe2 (p, O_CLOEXEC);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "create pipe2");
+
+  closep0 = p[0];
+  closep1 = p[1];
+
+  target_pid = getpid ();
+
+  pid = fork ();
+  if (UNLIKELY (pid < 0))
+    return crun_make_error (err, errno, "fork");
+
+  if (pid == 0)
+    {
+      cleanup_free char *uid_map_file = NULL;
+      cleanup_free char *gid_map_file = NULL;
+      cleanup_free char *uid_map = NULL;
+      cleanup_free char *gid_map = NULL;
+      char buffer[1];
+      size_t len;
+      uid_t uid = -1;
+      gid_t gid = -1;
+
+      close_and_reset (&closep1);
+
+      ret = TEMP_FAILURE_RETRY (read (p[0], buffer, sizeof (buffer)));
+      if (UNLIKELY (ret < 0))
+        _exit (errno);
+
+      if (container->container_def->process && container->container_def->process->user)
+        {
+          uid = container->container_def->process->user->uid;
+          gid = container->container_def->process->user->gid;
+        }
+      xasprintf (&uid_map_file, "/proc/%d/uid_map", target_pid);
+      xasprintf (&gid_map_file, "/proc/%d/gid_map", target_pid);
+
+      len = xasprintf (&gid_map, "%d 0 1", gid);
+      ret = write_file (gid_map_file, gid_map, len, err);
+      if (UNLIKELY (ret < 0))
+        _exit (crun_error_get_errno (err));
+
+      len = xasprintf (&uid_map, "%d 0 1", uid);
+      ret = write_file (uid_map_file, uid_map, len, err);
+      if (UNLIKELY (ret < 0))
+        _exit (crun_error_get_errno (err));
+
+      _exit (EXIT_SUCCESS);
+    }
+
+  close_and_reset (&closep0);
+
+  ret = unshare (CLONE_NEWUSER);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "unshare (CLONE_NEWUSER)");
+
+  ret = TEMP_FAILURE_RETRY (write (p[1], "0", 1));
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "write to sync pipe");
+
+  ret = TEMP_FAILURE_RETRY (waitpid (pid, &pid_status, 0));
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "waitpid for exec child pid");
+
+  if (UNLIKELY (WEXITSTATUS (pid_status) != 0))
+    return crun_make_error (err, WEXITSTATUS (pid_status), "setting mapping for final userns");
+
+  to_unshare = 0;
+  for (i = 0; i < def->linux->namespaces_len; i++)
+    {
+      if (def->linux->namespaces[i]->path != NULL && def->linux->namespaces[i]->path[0] != '\0')
+        continue;
+
+      to_unshare |= libcrun_find_namespace (def->linux->namespaces[i]->type);
+    }
+
+  if (to_unshare)
+    {
+      ret = unshare (to_unshare & (CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS));
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, errno, "unshare");
+    }
 
   return 0;
 }

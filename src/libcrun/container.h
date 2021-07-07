@@ -29,6 +29,7 @@ struct libcrun_context_s
   const char *id;
   const char *bundle;
   const char *config_file;
+  const char *config_file_content;
   const char *console_socket;
   const char *pid_file;
   const char *notify_socket;
@@ -45,6 +46,10 @@ struct libcrun_context_s
   bool no_new_keyring;
   bool force_no_cgroup;
   bool no_pivot;
+
+  int (*exec_func) (void *container, void *arg, const char *pathname, char *const argv[]);
+  void *exec_func_arg;
+
   bool kontain;
 };
 
@@ -63,6 +68,8 @@ struct libcrun_container_s
 
   uid_t container_uid;
   gid_t container_gid;
+
+  bool use_intermediate_userns;
 
   void *private_data;
   struct libcrun_context_s *context;
@@ -83,12 +90,15 @@ struct libcrun_checkpoint_restore_s
   bool shell_job;
   bool ext_unix_sk;
   bool detach;
+  const char *console_socket;
 };
 typedef struct libcrun_checkpoint_restore_s libcrun_checkpoint_restore_t;
 
 LIBCRUN_PUBLIC libcrun_container_t *libcrun_container_load_from_file (const char *path, libcrun_error_t *err);
 
 LIBCRUN_PUBLIC libcrun_container_t *libcrun_container_load_from_memory (const char *json, libcrun_error_t *err);
+
+LIBCRUN_PUBLIC void libcrun_container_free (libcrun_container_t *);
 
 LIBCRUN_PUBLIC int libcrun_container_run (libcrun_context_t *context, libcrun_container_t *container,
                                           unsigned int options, libcrun_error_t *error);
@@ -137,5 +147,18 @@ LIBCRUN_PUBLIC int libcrun_container_checkpoint (libcrun_context_t *context, con
 
 LIBCRUN_PUBLIC int libcrun_container_restore (libcrun_context_t *context, const char *id,
                                               libcrun_checkpoint_restore_t *cr_options, libcrun_error_t *err);
+
+// Not part of the public API, just a method in container.c we need to access from linux.c
+void get_root_in_the_userns (runtime_spec_schema_config_schema *def, uid_t host_uid, gid_t host_gid,
+                             uid_t *uid, gid_t *gid);
+
+static inline void
+cleanup_containerp (libcrun_container_t **c)
+{
+  libcrun_container_t *container = *c;
+  libcrun_container_free (container);
+}
+
+#define cleanup_container __attribute__ ((cleanup (cleanup_containerp)))
 
 #endif

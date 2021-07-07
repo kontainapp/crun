@@ -33,8 +33,7 @@
           }                                                   \
         if (status)                                           \
           exit (status);                                      \
-      }                                                       \
-    while (0)
+    } while (0)
 #endif
 #include <stdlib.h>
 #include <stdio.h>
@@ -54,8 +53,7 @@ typedef struct libcrun_error_s *libcrun_error_t;
     {                                    \
       fprintf (stderr, "out of memory"); \
       _exit (EXIT_FAILURE);              \
-    }                                    \
-  while (0)
+  } while (0)
 
 typedef void (*crun_output_handler) (int errno_, const char *msg, bool warning, void *arg);
 
@@ -95,6 +93,8 @@ LIBCRUN_PUBLIC int libcrun_init_logging (crun_output_handler *output_handler, vo
                                          const char *log, libcrun_error_t *err);
 
 LIBCRUN_PUBLIC int libcrun_error_release (libcrun_error_t *err);
+
+int yajl_error_to_crun_error (int yajl_status, libcrun_error_t *err);
 
 enum
 {

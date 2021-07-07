@@ -70,6 +70,9 @@ struct bpf_program
 #  define BPF_JMP_IMM(OP, DST, IMM, OFF) \
     ((struct bpf_insn){ .code = BPF_JMP | BPF_OP (OP) | BPF_K, .dst_reg = DST, .src_reg = 0, .off = OFF, .imm = IMM })
 
+#  define BPF_JMP_REG(OP, DST, SRC, OFF) \
+    ((struct bpf_insn){ .code = BPF_JMP | BPF_OP (OP) | BPF_X, .dst_reg = DST, .src_reg = SRC, .off = OFF, .imm = 0 })
+
 #  define BPF_MOV64_IMM(DST, IMM) \
     ((struct bpf_insn){ .code = BPF_ALU64 | BPF_MOV | BPF_K, .dst_reg = DST, .src_reg = 0, .off = 0, .imm = IMM })
 
@@ -157,7 +160,7 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
   };
 
   if (program->private & HAS_WILDCARD)
-    return 0;
+    return program;
 
   for (i = 0; access[i]; i++)
     {
@@ -180,7 +183,7 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
   /*
     if (request.type != device.type)
       goto next_block:
-    if ((request.access & device.access) == 0)
+    if ((request.access & device.access) != request.access)
       goto next_block:
     if (device.major != '*' && request.major != device.major) == 0)
       goto next_block:
@@ -207,7 +210,7 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
       struct bpf_insn i[] = {
         BPF_MOV32_REG (BPF_REG_1, BPF_REG_3),
         BPF_ALU32_IMM (BPF_AND, BPF_REG_1, bpf_access),
-        BPF_JMP_IMM (BPF_JEQ, BPF_REG_1, 0, number_instructions - 2),
+        BPF_JMP_REG (BPF_JNE, BPF_REG_1, BPF_REG_3, number_instructions - 2),
       };
       number_instructions -= 3;
       program = bpf_program_append (program, i, sizeof (i));
@@ -230,6 +233,12 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
 
   program = bpf_program_append (program, accept_block, sizeof (accept_block));
 #endif
+  (void) access;
+  (void) type;
+  (void) major;
+  (void) minor;
+  (void) accept;
+
   return program;
 }
 
@@ -285,7 +294,6 @@ read_all_progs (int dirfd, uint32_t **progs_out, size_t *n_progs_out, libcrun_er
   return 0;
 #else
   (void) dirfd;
-  (void) err;
 
   *progs_out = NULL;
   *n_progs_out = 0;
@@ -335,6 +343,9 @@ remove_all_progs (int dirfd, uint32_t *progs, size_t n_progs, libcrun_error_t *e
     }
   return 0;
 #else
+  (void) dirfd;
+  (void) progs;
+  (void) n_progs;
   return crun_make_error (err, 0, "eBPF not supported");
 #endif
 }
@@ -343,6 +354,11 @@ static int
 ebpf_attach_program (int fd, int dirfd, libcrun_error_t *err)
 {
 #ifndef HAVE_EBPF
+  (void) fd;
+  (void) dirfd;
+  (void) read_all_progs;
+  (void) remove_all_progs;
+
   return crun_make_error (err, 0, "eBPF not supported");
 #else
 #  ifdef BPF_F_REPLACE
@@ -426,6 +442,11 @@ int
 libcrun_ebpf_load (struct bpf_program *program, int dirfd, const char *pin, libcrun_error_t *err)
 {
 #ifndef HAVE_EBPF
+  (void) dirfd;
+  (void) program;
+  (void) pin;
+  (void) ebpf_attach_program;
+
   return crun_make_error (err, 0, "eBPF not supported");
 #else
   cleanup_close int fd = -1;

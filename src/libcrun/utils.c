@@ -40,15 +40,31 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 #include <limits.h>
+#include <stdarg.h>
+#ifdef HAVE_LINUX_OPENAT2_H
+#  include <linux/openat2.h>
+#endif
 
+#ifndef CLOSE_RANGE_CLOEXEC
+#  define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
 #ifndef RESOLVE_IN_ROOT
 #  define RESOLVE_IN_ROOT 0x10
+#endif
+#ifndef __NR_close_range
+#  define __NR_close_range 436
 #endif
 #ifndef __NR_openat2
 #  define __NR_openat2 437
 #endif
 
 #define MAX_READLINKS 32
+
+static int
+syscall_close_range (unsigned int fd, unsigned int max_fd, unsigned int flags)
+{
+  return (int) syscall (__NR_close_range, fd, max_fd, flags);
+}
 
 static int
 syscall_openat2 (int dirfd, const char *path, uint64_t flags, uint64_t mode, uint64_t resolve)
@@ -152,7 +168,9 @@ get_file_type_fd (int fd, mode_t *mode)
   int ret;
 
 #ifdef HAVE_STATX
-  struct statx stx;
+  struct statx stx = {
+    0,
+  };
 
   ret = statx (fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_TYPE, &stx);
   if (UNLIKELY (ret < 0))
@@ -179,7 +197,9 @@ get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path)
   int ret;
 
 #ifdef HAVE_STATX
-  struct statx stx;
+  struct statx stx = {
+    0,
+  };
 
   ret = statx (dirfd, path, (nofollow ? AT_SYMLINK_NOFOLLOW : 0) | AT_STATX_DONT_SYNC, STATX_TYPE, &stx);
   if (UNLIKELY (ret < 0))
@@ -229,48 +249,39 @@ ensure_directory_internal_at (int dirfd, char *path, size_t len, int mode, libcr
 {
   char *it = path + len;
   int ret = 0;
-  int parent_created;
+  bool parent_created = false;
 
-  for (parent_created = 0; parent_created < 2; parent_created++)
+  for (;;)
     {
       ret = mkdirat (dirfd, path, mode);
-      if (ret == 0)
-        break;
+      if (ret == 0 || errno == EEXIST)
+        return 0;
 
-      if (errno == EEXIST)
-        {
-          ret = 0;
-          break;
-        }
-
-      if (errno != ENOENT || parent_created)
+      if (parent_created || errno != ENOENT)
         {
           /* On errors check if the directory already exists.  */
           ret = crun_dir_p (path, false, err);
           if (ret > 0)
-            break;
+            return 0;
 
           return crun_make_error (err, errno, "create directory `%s`", path);
         }
-      else
-        {
-          while (it > path && *it != '/')
-            {
-              it--;
-              len--;
-            }
-          if (it == path)
-            {
-              ret = 0;
-              break;
-            }
 
-          *it = '\0';
-          ret = ensure_directory_internal_at (dirfd, path, len - 1, mode, err);
-          *it = '/';
-          if (UNLIKELY (ret < 0))
-            break;
+      while (it > path && *it != '/')
+        {
+          it--;
+          len--;
         }
+      if (it == path)
+        return 0;
+
+      *it = '\0';
+      ret = ensure_directory_internal_at (dirfd, path, len - 1, mode, err);
+      *it = '/';
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      parent_created = true;
     }
   return ret;
 }
@@ -332,7 +343,8 @@ safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path,
   int ret;
   cleanup_close int fd = -1;
   static bool openat2_supported = true;
-  char buffer[PATH_MAX], *path_in_chroot;
+  const char *path_in_chroot;
+  char buffer[PATH_MAX];
 
   if (openat2_supported)
     {
@@ -341,7 +353,7 @@ safe_openat (int dirfd, const char *rootfs, size_t rootfs_len, const char *path,
         {
           if (errno == ENOSYS)
             openat2_supported = false;
-          if (errno == ENOSYS || errno == EINVAL)
+          if (errno == ENOSYS || errno == EINVAL || errno == EPERM)
             goto fallback;
           return crun_make_error (err, errno, "openat2 `%s`", path);
         }
@@ -355,8 +367,16 @@ fallback:
     return crun_make_error (err, errno, "cannot resolve `%s` under rootfs", path);
 
   path_in_chroot += rootfs_len;
-  while (*path_in_chroot == '/')
-    path_in_chroot++;
+  path_in_chroot = consume_slashes (path_in_chroot);
+
+  /* If the path is empty we are at the root, dup the dirfd itself.  */
+  if (path_in_chroot[0] == '\0')
+    {
+      ret = dup (dirfd);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, errno, "dup `%s`", rootfs);
+      return ret;
+    }
 
   ret = openat (dirfd, path_in_chroot, flags, mode);
   if (UNLIKELY (ret < 0))
@@ -374,7 +394,8 @@ fallback:
 }
 
 static int
-crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
+crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
+                     size_t dirpath_len, const char *path, int mode,
                      int max_readlinks, libcrun_error_t *err)
 {
   cleanup_close int wd_cleanup = -1;
@@ -389,8 +410,7 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
   if (max_readlinks <= 0)
     return crun_make_error (err, ELOOP, "resolve path `%s`", path);
 
-  while (*path == '/')
-    path++;
+  path = consume_slashes (path);
 
   npath = xstrdup (path);
 
@@ -423,14 +443,14 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
             depth--;
           else
             {
+              /* Start from the root.  */
               close_and_reset (&wd_cleanup);
               cwd = dirfd;
+              goto next;
             }
         }
 
-      if (! last_component || dir)
-        ret = mkdirat (cwd, cur, mode);
-      else
+      if (last_component && ! dir)
         {
           ret = openat (cwd, cur, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW, 0700);
           if (UNLIKELY (ret < 0))
@@ -447,14 +467,15 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
                       resolved_path = xrealloc (resolved_path, resolved_size);
 
                       s = readlinkat (dirfd, npath, resolved_path, resolved_size);
-                    }
-                  while (s == resolved_size);
+                  } while (s == resolved_size);
 
                   if (s > 0)
                     {
                       resolved_path[s] = '\0';
                       crun_error_release (err);
-                      return crun_safe_ensure_at (dir, dirfd, dirpath, dirpath_len, resolved_path, mode,
+                      return crun_safe_ensure_at (do_open, dir, dirfd,
+                                                  dirpath, dirpath_len,
+                                                  resolved_path, mode,
                                                   max_readlinks - 1, err);
                     }
                 }
@@ -464,11 +485,14 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
                 return crun_make_error (err, errno, "open `%s/%s`", dirpath, cur);
             }
 
-          close_and_replace (&wd_cleanup, ret);
+          if (do_open)
+            return ret;
 
+          close_and_replace (&wd_cleanup, ret);
           return 0;
         }
 
+      ret = mkdirat (cwd, cur, mode);
       if (ret < 0)
         {
           if (errno != EEXIST)
@@ -490,21 +514,44 @@ crun_safe_ensure_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_le
       it = strchr (cur, '/');
     }
 
+  if (do_open)
+    {
+      if (cwd == dirfd)
+        return dup (dirfd);
+
+      wd_cleanup = -1;
+      return cwd;
+    }
+
   return 0;
+}
+
+int
+crun_safe_create_and_open_ref_at (bool dir, int dirfd, const char *dirpath, size_t dirpath_len,
+                                  const char *path, int mode, libcrun_error_t *err)
+{
+  int fd;
+
+  /* If the file/dir already exists, just open it.  */
+  fd = safe_openat (dirfd, dirpath, dirpath_len, path, O_PATH | O_CLOEXEC, 0, err);
+  if (LIKELY (fd >= 0))
+    return fd;
+
+  return crun_safe_ensure_at (true, dir, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
 }
 
 int
 crun_safe_ensure_directory_at (int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
                                libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (true, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, true, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
 }
 
 int
 crun_safe_ensure_file_at (int dirfd, const char *dirpath, size_t dirpath_len, const char *path, int mode,
                           libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (false, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, false, dirfd, dirpath, dirpath_len, path, mode, MAX_READLINKS, err);
 }
 
 int
@@ -548,7 +595,9 @@ get_file_size (int fd, off_t *size)
   struct stat st;
   int ret;
 #ifdef HAVE_STATX
-  struct statx stx;
+  struct statx stx = {
+    0,
+  };
 
   ret = statx (fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC, STATX_SIZE, &stx);
   if (UNLIKELY (ret < 0))
@@ -591,12 +640,21 @@ int
 check_running_in_user_namespace (libcrun_error_t *err)
 {
   cleanup_free char *buffer = NULL;
+  static int run_in_userns = -1;
   size_t len;
-  int ret = read_all_file ("/proc/self/uid_map", &buffer, &len, err);
+  int ret;
+
+  ret = run_in_userns;
+  if (ret >= 0)
+    return ret;
+
+  ret = read_all_file ("/proc/self/uid_map", &buffer, &len, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  return strstr (buffer, "4294967295") ? 0 : 1;
+  ret = strstr (buffer, "4294967295") ? 0 : 1;
+  run_in_userns = ret;
+  return ret;
 }
 
 static int selinux_enabled = -1;
@@ -820,12 +878,24 @@ open_unix_domain_client_socket (const char *path, int dgram, libcrun_error_t *er
 {
   struct sockaddr_un addr = {};
   int ret;
-  cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
+  char name_buf[32];
+  cleanup_close int destfd = -1;
+  cleanup_close int fd = -1;
+
+  fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error creating UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
-    return crun_make_error (err, 0, "invalid path %s specified", path);
+    {
+      destfd = open (path, O_PATH);
+      if (UNLIKELY (destfd < 0))
+        return crun_make_error (err, errno, "error opening `%s`", path);
+
+      sprintf (name_buf, "/proc/self/fd/%d", destfd);
+      path = name_buf;
+    }
+
   strcpy (addr.sun_path, path);
   addr.sun_family = AF_UNIX;
   ret = connect (fd, (struct sockaddr *) &addr, sizeof (addr));
@@ -843,12 +913,16 @@ open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err)
 {
   struct sockaddr_un addr = {};
   int ret;
+  char name_buf[32];
   cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "error creating UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
-    return crun_make_error (err, 0, "invalid path %s specified", path);
+    {
+      sprintf (name_buf, "/proc/self/fd/%d", fd);
+      path = name_buf;
+    }
   strcpy (addr.sun_path, path);
   addr.sun_family = AF_UNIX;
   ret = bind (fd, (struct sockaddr *) &addr, sizeof (addr));
@@ -871,16 +945,28 @@ open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err)
 int
 send_fd_to_socket (int server, int fd, libcrun_error_t *err)
 {
+  return send_fd_to_socket_with_payload (server, fd, NULL, 0, err);
+}
+
+int
+send_fd_to_socket_with_payload (int server, int fd, const char *payload, size_t payload_len, libcrun_error_t *err)
+{
   int ret;
   struct cmsghdr *cmsg = NULL;
-  struct iovec iov[1];
+  struct iovec iov[2];
   struct msghdr msg = {};
-  char ctrl_buf[CMSG_SPACE (sizeof (int))] = {};
+  char ctrl_buf[CMSG_SPACE (1 + sizeof (int))] = {};
   char data[1];
 
   data[0] = ' ';
   iov[0].iov_base = data;
   iov[0].iov_len = sizeof (data);
+
+  if (payload_len > 0)
+    {
+      iov[0].iov_base = (void *) payload;
+      iov[0].iov_len = payload_len;
+    }
 
   msg.msg_name = NULL;
   msg.msg_namelen = 0;
@@ -927,6 +1013,8 @@ receive_fd_from_socket (int from, libcrun_error_t *err)
   ret = TEMP_FAILURE_RETRY (recvmsg (from, &msg, 0));
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "recvmsg");
+  if (UNLIKELY (ret == 0))
+    return crun_make_error (err, 0, "read FD: connection closed");
 
   cmsg = CMSG_FIRSTHDR (&msg);
   if (cmsg == NULL)
@@ -1032,8 +1120,7 @@ copy_from_fd_to_fd (int src, int dst, int consume, libcrun_error_t *err)
             return crun_make_error (err, errno, "write");
           remaining -= ret;
         }
-    }
-  while (consume && nread);
+  } while (consume && nread);
 
   return 0;
 }
@@ -1144,7 +1231,8 @@ set_home_env (uid_t id)
   if (stream == NULL)
     {
       if (errno == ENOENT)
-        return 0;
+        goto exit;
+
       return -1;
     }
 
@@ -1173,6 +1261,10 @@ set_home_env (uid_t id)
           return 0;
         }
     }
+
+exit:
+  /* If the user was not found, set it to something reasonable.  */
+  setenv ("HOME", "/", 1);
   return 0;
 }
 
@@ -1364,6 +1456,10 @@ run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, i
       char *tmp_args[] = { path, NULL };
       int dev_null_fd = -1;
 
+      ret = mark_for_close_fds_ge_than (3, err);
+      if (UNLIKELY (ret < 0))
+        libcrun_fail_with_error ((*err)->status, "%s", (*err)->msg);
+
       if (out_fd < 0 || err_fd < 0)
         {
           dev_null_fd = open ("/dev/null", O_WRONLY);
@@ -1398,7 +1494,7 @@ run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, i
 }
 
 int
-close_fds_ge_than (int n, libcrun_error_t *err)
+mark_for_close_fds_ge_than (int n, libcrun_error_t *err)
 {
   cleanup_close int cfd = -1;
   cleanup_dir DIR *dir = NULL;
@@ -1406,6 +1502,12 @@ close_fds_ge_than (int n, libcrun_error_t *err)
   int fd;
   struct statfs sfs;
   struct dirent *next;
+
+  ret = syscall_close_range (n, UINT_MAX, CLOSE_RANGE_CLOEXEC);
+  if (ret == 0)
+    return 0;
+  if (ret < 0 && errno != EINVAL && errno != ENOSYS && errno != EPERM)
+    return crun_make_error (err, errno, "close_range from %d", n);
 
   cfd = open ("/proc/self/fd", O_DIRECTORY | O_RDONLY | O_CLOEXEC);
   if (UNLIKELY (cfd < 0))
@@ -1498,7 +1600,11 @@ check_access (const char *path)
   int ret;
   mode_t mode;
 
+#ifdef ANDROID
+  ret = access (path, X_OK);
+#else
   ret = eaccess (path, X_OK);
+#endif
   if (ret < 0)
     return ret;
 
@@ -1537,7 +1643,7 @@ find_executable (const char *executable_path, const char *cwd)
 
       if (cwd == NULL)
         {
-          cwd_allocated = get_current_dir_name ();
+          cwd_allocated = getcwd (NULL, 0);
           if (cwd_allocated == NULL)
             OOM ();
 
@@ -1679,7 +1785,9 @@ copy_rec_stat_file_at (int dfd, const char *path, mode_t *mode, off_t *size, dev
   int ret;
 
 #ifdef HAVE_STATX
-  struct statx stx;
+  struct statx stx = {
+    0,
+  };
 
   ret = statx (dfd, path, AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
                STATX_TYPE | STATX_MODE | STATX_SIZE | STATX_UID | STATX_GID, &stx);
@@ -1810,8 +1918,7 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
               size = readlinkat (dirfd (dsrcfd), de->d_name, target_buf, buf_size);
               if (UNLIKELY (size < 0))
                 return crun_make_error (err, errno, "readlink `%s/%s`", srcname, de->d_name);
-            }
-          while (size == buf_size);
+          } while (size == buf_size);
 
           ret = symlinkat (target_buf, destdirfd, de->d_name);
           if (UNLIKELY (ret < 0))
@@ -1901,4 +2008,152 @@ safe_write (int fd, const void *buf, ssize_t count)
       written += w;
     }
   return written;
+}
+
+int
+append_paths (char **out, libcrun_error_t *err, ...)
+{
+  const size_t MAX_PARTS = 32;
+  const char *parts[MAX_PARTS];
+  size_t sizes[MAX_PARTS];
+  size_t total_len = 0;
+  size_t n_parts = 0;
+  size_t copied = 0;
+  va_list ap;
+  size_t i;
+
+  va_start (ap, err);
+  for (;;)
+    {
+      const char *part;
+      size_t size;
+
+      part = va_arg (ap, const char *);
+      if (part == NULL)
+        break;
+
+      if (n_parts == MAX_PARTS)
+        {
+          va_end (ap);
+          return crun_make_error (err, EINVAL, "too many paths specified");
+        }
+
+      if (n_parts == 0)
+        {
+          /* For the first component allow only one '/'.  */
+          while (part[0] == '/' && part[1] == '/')
+            part++;
+        }
+      else
+        {
+          /* And drop any initial '/' for other components.  */
+          while (part[0] == '/')
+            part++;
+        }
+
+      size = strlen (part);
+      if (size == 0)
+        continue;
+
+      while (size > 1 && part[size - 1] == '/')
+        size--;
+
+      parts[n_parts] = part;
+      sizes[n_parts] = size;
+
+      n_parts++;
+    }
+  va_end (ap);
+
+  total_len = n_parts + 1;
+  for (i = 0; i < n_parts; i++)
+    total_len += sizes[i];
+
+  *out = xmalloc (total_len);
+
+  copied = 0;
+  for (i = 0; i < n_parts; i++)
+    {
+      bool has_trailing_slash;
+
+      has_trailing_slash = copied > 0 && (*out)[copied - 1] == '/';
+      if (i > 0 && ! has_trailing_slash)
+        {
+          (*out)[copied] = '/';
+          copied += 1;
+        }
+
+      memcpy (*out + copied, parts[i], sizes[i]);
+      copied += sizes[i];
+    }
+  (*out)[copied] = '\0';
+  return 0;
+}
+
+/* Adapted from mailutils 0.6.91 (distributed under LGPL 2.0+)  */
+static int
+b64_input (char c)
+{
+  const char table[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int i;
+
+  for (i = 0; i < 64; i++)
+    {
+      if (table[i] == c)
+        return i;
+    }
+  return -1;
+}
+
+int
+base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t *nbytes)
+{
+  int i = 0, tmp = 0, pad = 0;
+  size_t consumed = 0;
+  unsigned char data[4];
+
+  *nbytes = 0;
+  while (consumed < isize && (*nbytes) + 3 < osize)
+    {
+      while ((i < 4) && (consumed < isize))
+        {
+          tmp = b64_input (*iptr++);
+          consumed++;
+          if (tmp != -1)
+            data[i++] = tmp;
+          else if (*(iptr - 1) == '=')
+            {
+              data[i++] = '\0';
+              pad++;
+            }
+        }
+
+      /* I have a entire block of data 32 bits get the output data.  */
+      if (i == 4)
+        {
+          *optr++ = (data[0] << 2) | ((data[1] & 0x30) >> 4);
+          *optr++ = ((data[1] & 0xf) << 4) | ((data[2] & 0x3c) >> 2);
+          *optr++ = ((data[2] & 0x3) << 6) | data[3];
+          (*nbytes) += 3 - pad;
+        }
+      else
+        {
+          /* I did not get all the data.  */
+          consumed -= i;
+          return consumed;
+        }
+      i = 0;
+    }
+  return consumed;
+}
+
+char *
+get_user_name (uid_t uid)
+{
+  struct passwd pd;
+  struct passwd *temp_result_ptr;
+  char pwdbuffer[200];
+  if (! getpwuid_r (uid, &pd, pwdbuffer, sizeof (pwdbuffer), &temp_result_ptr))
+    return xstrdup (pd.pw_name);
+  return xstrdup ("");
 }

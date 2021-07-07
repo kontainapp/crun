@@ -21,6 +21,10 @@
 #include "container.h"
 #include <unistd.h>
 
+#ifndef CGROUP_ROOT
+#  define CGROUP_ROOT "/sys/fs/cgroup"
+#endif
+
 enum
 {
   CGROUP_MODE_UNIFIED = 1,
@@ -49,6 +53,7 @@ struct libcrun_cgroup_args
   gid_t root_gid;
   const char *id;
   const char *systemd_subgroup;
+  const char *delegate_cgroup;
 };
 
 LIBCRUN_PUBLIC int libcrun_get_cgroup_mode (libcrun_error_t *err);
@@ -68,8 +73,8 @@ LIBCRUN_PUBLIC int libcrun_cgroup_read_pids (const char *path, bool recurse, pid
 int libcrun_cgroup_enter (struct libcrun_cgroup_args *args, libcrun_error_t *err);
 int libcrun_cgroups_create_symlinks (int dirfd, libcrun_error_t *err);
 
-typedef const char *cgroups_subsystem_t;
+int parse_sd_array (char *s, char **out, char **next, libcrun_error_t *err);
 
-const cgroups_subsystem_t *libcrun_get_cgroups_subsystems ();
+int libcrun_cgroup_has_oom (const char *path, int cgroup_mode, libcrun_error_t *err);
 
 #endif

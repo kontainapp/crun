@@ -8,7 +8,6 @@ AC_CONFIG_MACRO_DIR([m4])
 AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_CONFIG_SRCDIR([src/crun.c])
 
-AC_PROG_RANLIB
 LT_INIT([disable-shared])
 
 AM_INIT_AUTOMAKE([1.11.2 -Wno-portability foreign tar-ustar no-dist-gzip dist-xz subdir-objects])
@@ -25,9 +24,25 @@ AC_PATH_PROG(MD2MAN, go-md2man)
 
 AM_CONDITIONAL([HAVE_MD2MAN], [test "x$ac_cv_path_MD2MAN" != x])
 
-AC_CHECK_HEADERS([error.h])
+AC_CHECK_HEADERS([error.h linux/openat2.h])
 
 AC_CHECK_FUNCS(copy_file_range fgetxattr statx fgetpwent_r issetugid)
+
+dnl embedded yajl
+AC_ARG_ENABLE(embedded-yajl,
+AS_HELP_STRING([--enable-embedded-yajl], [Statically link a modified yajl version]),
+[
+case "${enableval}" in
+  yes) embedded_yajl=true ;;
+  no)  embedded_yajl=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-embedded-yajl) ;;
+esac],[embedded_yajl=false])
+
+AM_CONDITIONAL([HAVE_EMBEDDED_YAJL], [test x"$embedded_yajl" == xtrue])
+AM_COND_IF([HAVE_EMBEDDED_YAJL], [], [
+AC_SEARCH_LIBS(yajl_tree_get, [yajl], [AC_DEFINE([HAVE_YAJL], 1, [Define if libyajl is available])], [AC_MSG_ERROR([*** libyajl headers not found])])
+PKG_CHECK_MODULES([YAJL], [yajl >= 2.0.0])
+])
 
 dnl libcap
 AC_ARG_ENABLE([caps],
@@ -39,6 +54,15 @@ AS_IF([test "x$enable_caps" != "xno"], [
 	])
 ])
 
+dnl dl
+AC_ARG_ENABLE([dl], AS_HELP_STRING([--disable-dl], [Disable dynamic libraries support]))
+AS_IF([test "x$enable_dl" != "xno"], [
+        AC_SEARCH_LIBS([dlopen], [dl], [AC_DEFINE([HAVE_DLOPEN], 1, [Define if DLOPEN is available])], [])
+])
+
+dnl include support for libkrun (EXPERIMENTAL)
+AC_ARG_WITH([libkrun], AS_HELP_STRING([--with-libkrun], [build with libkrun support]))
+AS_IF([test "x$with_libkrun" = "xyes"], AC_CHECK_HEADERS([libkrun.h], AC_DEFINE([HAVE_LIBKRUN], 1, [Define if libkrun is available]), [AC_MSG_ERROR([*** Missing libkrun headers])]))
 dnl libseccomp
 AC_ARG_ENABLE([seccomp],
 	AS_HELP_STRING([--disable-seccomp], [Ignore libseccomp and disable support]))
@@ -69,7 +93,14 @@ AS_IF([test "x$enable_bpf" != "xno"], [
 		AC_MSG_CHECKING(compilation for eBPF)
 		AC_COMPILE_IFELSE(
 			[AC_LANG_SOURCE([[
+				#include <unistd.h>
+				#include <stdint.h>
 				#include <linux/bpf.h>
+                                void foo() {
+					uint64_t val = 0x123456789;
+					union bpf_attr attr;
+					attr.insns = val;
+                                }
 				int program = BPF_PROG_TYPE_CGROUP_DEVICE;
 			]])],
 			[AC_MSG_RESULT(yes)
@@ -78,9 +109,6 @@ AS_IF([test "x$enable_bpf" != "xno"], [
 	])
 ])
 
-
-AC_SEARCH_LIBS(yajl_tree_get, [yajl], [AC_DEFINE([HAVE_YAJL], 1, [Define if libyajl is available])], [AC_MSG_ERROR([*** libyajl headers not found])])
-PKG_CHECK_MODULES([YAJL], [yajl >= 2.0.0])
 
 AC_ARG_WITH([python-bindings], AS_HELP_STRING([--with-python-bindings], [build the Python bindings]))
 AS_IF([test "x$with_python_bindings" = "xyes"], [
@@ -94,18 +122,18 @@ AS_IF([test "x$with_python_bindings" = "xyes"], [
 dnl criu
 AC_ARG_ENABLE([criu], AS_HELP_STRING([--disable-criu], [Disable CRIU based checkpoint/restore support]))
 AS_IF([test "x$enable_criu" != "xno"], [
-            PKG_CHECK_MODULES([CRIU], [criu >= 3.13], [have_criu="yes"], [have_criu="no"
-			       AC_MSG_RESULT([CRIU headers not found, building without CRIU support])])
+            PKG_CHECK_MODULES([CRIU], [criu >= 3.15], [have_criu="yes"], [have_criu="no"
+			       AC_MSG_NOTICE([CRIU headers not found, building without CRIU support])])
 	    AS_IF([test "$have_criu" = "yes"], [
 		   AC_DEFINE([HAVE_CRIU], 1, [Define if CRIU is available])
 		   AC_SEARCH_LIBS(criu_init_opts, [criu])
 	    ])
-], [AC_MSG_RESULT([CRIU support disabled per user request])])
+], [AC_MSG_NOTICE([CRIU support disabled per user request])])
 
 FOUND_LIBS=$LIBS
 LIBS=""
 
-dnl mount API
+AC_MSG_CHECKING([for new mount API (fsconfig)])
 AC_COMPILE_IFELSE(
 	[AC_LANG_SOURCE([[
 			#include <linux/mount.h>
@@ -115,7 +143,7 @@ AC_COMPILE_IFELSE(
 		 AC_DEFINE([HAVE_FSCONFIG_CMD_CREATE], 1, [Define if FSCONFIG_CMD_CREATE is available])],
 		[AC_MSG_RESULT(no)])
 
-dnl seccomp notify API
+AC_MSG_CHECKING([for seccomp notify API])
 AC_COMPILE_IFELSE(
 	[AC_LANG_SOURCE([[
 			#include <linux/seccomp.h>
@@ -137,8 +165,6 @@ AC_CHECK_TOOL(GPERF, gperf)
 if test -z "$GPERF"; then
        AC_MSG_NOTICE(gperf not found - cannot rebuild signal parser code)
 fi
-
-AC_SEARCH_LIBS([dlopen], [dl], [AC_DEFINE([HAVE_DLOPEN], 1, [Define if DLOPEN is available])]], [])
 
 AC_SEARCH_LIBS([argp_parse], [argp], [], [AC_MSG_ERROR([*** argp functions not found - install libargp or argp_standalone])])
 

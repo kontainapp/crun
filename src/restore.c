@@ -39,7 +39,8 @@ enum
   OPTION_TCP_ESTABLISHED,
   OPTION_SHELL_JOB,
   OPTION_EXT_UNIX_SK,
-  OPTION_PID_FILE
+  OPTION_PID_FILE,
+  OPTION_CONSOLE_SOCKET,
 };
 
 static char doc[] = "OCI runtime";
@@ -59,6 +60,8 @@ static struct argp_option options[]
         { "shell-job", OPTION_SHELL_JOB, 0, 0, "allow shell jobs", 0 },
         { "detach", 'd', 0, 0, "detach from the container's process", 0 },
         { "pid-file", OPTION_PID_FILE, "FILE", 0, "where to write the PID of the container", 0 },
+        { "console-socket", OPTION_CONSOLE_SOCKET, "SOCKET", 0,
+          "path to a socket that will receive the master end of the tty", 0 },
         {
             0,
         } };
@@ -99,6 +102,10 @@ parse_opt (int key, char *arg arg_unused, struct argp_state *state arg_unused)
 
     case 'd':
       cr_options.detach = true;
+      break;
+
+    case OPTION_CONSOLE_SOCKET:
+      cr_options.console_socket = argp_mandatory_argument (arg, state);
       break;
 
     case OPTION_PID_FILE:
@@ -153,7 +160,7 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
     {
       cleanup_free char *path = NULL;
 
-      path = get_current_dir_name ();
+      path = getcwd (NULL, 0);
       if (UNLIKELY (path == NULL))
         libcrun_fail_with_error (0, "realloc failed");
 
