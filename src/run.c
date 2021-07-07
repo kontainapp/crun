@@ -168,12 +168,14 @@ crun_command_run (struct crun_global_arguments *global_args, int argc, char **ar
   if (UNLIKELY (ret < 0))
     return ret;
 
-  if (crun_context.kontain) {
-    ret = add_kontain_config(container);
-    if (ret != 0) {
-      libcrun_fail_with_error(0, "adding kontain bind mounts");
+  if (crun_context.kontain)
+    {
+      ret = add_kontain_config (container);
+      if (ret != 0)
+        {
+          libcrun_fail_with_error (0, "adding kontain bind mounts");
+        }
     }
-  }
 
   crun_context.bundle = bundle;
   if (getenv ("LISTEN_FDS"))

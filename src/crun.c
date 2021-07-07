@@ -302,15 +302,19 @@ main (int argc, char **argv)
   libcrun_error_t err = NULL;
   int ret, first_argument = 0;
 
-  char *cmd = strrchr(argv[0], '/');
-  if (cmd == NULL) {
-    cmd = argv[0];
-  } else {
-    cmd++;
-  }
-  if (strcmp(cmd, "krun") == 0) {
-     arguments.kontain = true;
-  }
+  char *cmd = strrchr (argv[0], '/');
+  if (cmd == NULL)
+    {
+      cmd = argv[0];
+    }
+  else
+    {
+      cmd++;
+    }
+  if (strcmp (cmd, "krun") == 0)
+    {
+      arguments.kontain = true;
+    }
 
   argp_program_version_hook = print_version;
 
