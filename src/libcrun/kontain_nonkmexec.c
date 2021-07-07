@@ -16,6 +16,7 @@
  * along with crun.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <config.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -50,7 +51,8 @@
 
 struct execpath_entry
 {
-  SLIST_ENTRY (execpath_entry) link;
+  SLIST_ENTRY (execpath_entry)
+  link;
   regex_t re;
   char *path;
   char sha256[EVP_MAX_MD_SIZE * 2 + 1];
@@ -101,7 +103,7 @@ libcrun_kontain_nonkmexec_clean (void)
 static void
 hash_2_ascii (unsigned char hash[EVP_MAX_MD_SIZE], unsigned int hash_len, char *ascii)
 {
-  int i;
+  unsigned int i;
   for (i = 0; i < hash_len; i++)
     {
       snprintf (&ascii[i * 2], 3, "%02x", hash[i]);
@@ -180,7 +182,7 @@ split_into_fields (char *dbentry, char *fields[])
  * There are 3 fields:
  *   regular expression to match an input string against
  *   the file to exec to if the regular expression matches
- *   the sha of the file being exec'ed to to verify the file is unchanged since the
+ *   the sha of the file being exec'ed to verify the file is unchanged since the
  *   db was created.
  * Example of a line in the file:
  *   /bin/ping|/usr/bin/ping:/bin/ping:XXXXXX
@@ -299,7 +301,6 @@ kontain_execpath_builddb (execpath_state_t *statep)
 static int
 kontain_execpath_lookup (execpath_state_t *statep, const char *execpath, execpath_entry_t **eppp)
 {
-  int rc;
   struct stat statb;
 
   if (stat (statep->execpath_dbpath, &statb) != 0)
