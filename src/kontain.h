@@ -21,6 +21,6 @@
 #include "crun.h"
 
 #define APP_KONTAIN_USEVIRT "app.kontain.use-virt"
-int add_kontain_config(libcrun_container_t *container);
+int add_kontain_config (libcrun_container_t *container);
 
 #endif

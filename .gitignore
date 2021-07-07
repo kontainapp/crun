@@ -64,7 +64,6 @@ stamp-h
 stamp-h.in
 stamp-h1
 tests/init
-<<<<<<< HEAD
 tests/tests_*
 tests/*.log
 tests/*.trs

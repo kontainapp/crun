@@ -116,8 +116,10 @@ def test_exec_non_km_payload_helper(execpath, nonkmok):
         what executables are allowed to be run without km's help.
     """
 
-    # only run these tests for krun, 77 tests the test controller this test was skipped
+    # only run these tests for krun, 77 tells the test controller this test was skipped
     runtime = os.getenv("OCI_RUNTIME")
+    if runtime is None:
+        return 77
     if os.path.basename(runtime) != "krun":
         return 77
 

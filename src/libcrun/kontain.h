@@ -21,8 +21,8 @@
 #define KM_BIN_PATH "/opt/kontain/bin/km"
 #define DOCKER_INIT_PATH "/sbin/docker-init"
 #define PODMAN_INIT_PATH "/dev/init"
-int libcrun_kontain_argv(char ***argv, const char **execpath);
-int libcrun_kontain_nonkmexec_allowed(const char* execpath, char** execpath_allowed);
-void libcrun_kontain_nonkmexec_clean(void);
+int libcrun_kontain_argv (char ***argv, const char **execpath);
+int libcrun_kontain_nonkmexec_allowed (const char *execpath, char **execpath_allowed);
+void libcrun_kontain_nonkmexec_clean (void);
 
 #endif
