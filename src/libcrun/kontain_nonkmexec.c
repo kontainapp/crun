@@ -24,7 +24,11 @@
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
-#include <sys/queue.h>
+#ifdef HAVE_BSD_QUEUE
+#  include <bsd/sys/queue.h>
+#else
+#  include <sys/queue.h>
+#endif
 #include <regex.h>
 #include <stdlib.h>
 #include <errno.h>
