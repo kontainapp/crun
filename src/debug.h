@@ -20,12 +20,12 @@
 
 #include "crun.h"
 
-void dumpmounts(libcrun_container_t *container);
-void dumpdevices(libcrun_container_t *container);
-void dumpannotations(libcrun_container_t *container);
-void dumpconfig(const char *config_file);
-void runtime_spec_to_file(runtime_spec_schema_config_schema *container);
-void dump_crun_context(libcrun_context_t *context);
-void debug(char *fmt, ...);
+void dumpmounts (libcrun_container_t *container);
+void dumpdevices (libcrun_container_t *container);
+void dumpannotations (libcrun_container_t *container);
+void dumpconfig (const char *config_file);
+void runtime_spec_to_file (runtime_spec_schema_config_schema *container);
+void dump_crun_context (libcrun_context_t *context);
+void debug (char *fmt, ...);
 
 #endif

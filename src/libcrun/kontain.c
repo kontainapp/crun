@@ -44,50 +44,56 @@
  *   0 - success
  *   errno - failure
  */
-int libcrun_kontain_argv(char ***argv, const char **execpath)
+int
+libcrun_kontain_argv (char ***argv, const char **execpath)
 {
-   struct stat statb;
-   char **newargv;
-   const char *cmd = *execpath;
+  struct stat statb;
+  char **newargv;
+  const char *cmd = *execpath;
 
-   if (cmd[0] != '/') {  // verify that we are getting an absolute path
+  if (cmd[0] != '/')
+    { // verify that we are getting an absolute path
       return EINVAL;
-   }
-   if (fstatat(AT_FDCWD, cmd, &statb, AT_SYMLINK_NOFOLLOW) != 0) {
+    }
+  if (fstatat (AT_FDCWD, cmd, &statb, AT_SYMLINK_NOFOLLOW) != 0)
+    {
       // the command does not exist?  Let the caller handle that.
       return errno;
-   }
-   if (strcmp (cmd, KM_BIN_PATH) != 0)
-   {
+    }
+  if (strcmp (cmd, KM_BIN_PATH) != 0)
+    {
       /* Some program other than km, assume they need km to run it so insert the path to km into argv[] */
       int argc;
-      for (argc = 0; (*argv)[argc] != NULL; argc++);
-      argc++;  // for null array terminator
+      for (argc = 0; (*argv)[argc] != NULL; argc++)
+        ;
+      argc++; // for null array terminator
 
       // grow argv[]
-      newargv = malloc((argc + 1) * sizeof(char*));
-      if (newargv == NULL) {
-         return ENOMEM;
-      }
+      newargv = malloc ((argc + 1) * sizeof (char *));
+      if (newargv == NULL)
+        {
+          return ENOMEM;
+        }
 
       // Set km to the program that is to be run, it will run the former argv[0]
-      newargv[0] = strdup(KM_BIN_PATH);
-      for (int i = 0; i <= argc; i++) {
-         newargv[i + 1] = (*argv)[i];
-      }
+      newargv[0] = strdup (KM_BIN_PATH);
+      for (int i = 0; i <= argc; i++)
+        {
+          newargv[i + 1] = (*argv)[i];
+        }
 
       // replace the payload filename and set the execpath to km's path
-      free(newargv[1]);
-      newargv[1] = (char *)strdup(*execpath);
-      *execpath = strdup(KM_BIN_PATH);
+      free (newargv[1]);
+      newargv[1] = (char *) strdup (*execpath);
+      *execpath = strdup (KM_BIN_PATH);
 
       // Give the caller the new argv[]
       char **oldargv = *argv;
       *argv = newargv;
-      free(oldargv);
-   }
+      free (oldargv);
+    }
 
-   /*
+  /*
     * If docker or podman run was invoked with --init then the actual entrypoint may
     * may be further in the argument list and may already have /opt/kontain/bin/km
     * in the argument list.  We need to remove the /opt/kontain/bin/km argument in
@@ -98,13 +104,15 @@ int libcrun_kontain_argv(char ***argv, const char **execpath)
     * podman:
     *  /opt/kontain/bin/km /dev/init -- /opt/kontain/bin/km /bin/sh
     */
-   if ((strcmp((*argv)[1], DOCKER_INIT_PATH) == 0 || strcmp((*argv)[1], PODMAN_INIT_PATH) == 0) &&
-       strcmp((*argv)[3], KM_BIN_PATH) == 0) {
-      free((*argv)[3]);
-      for (int i = 3; (*argv)[i] != NULL; i++) {
-         (*argv)[i] = (*argv)[i + 1];
-      }
-   }
+  if ((strcmp ((*argv)[1], DOCKER_INIT_PATH) == 0 || strcmp ((*argv)[1], PODMAN_INIT_PATH) == 0) && strcmp ((*argv)[3], KM_BIN_PATH) == 0)
+    {
+      char *avoid_maintmk_warning = (*argv)[3];
+      free (avoid_maintmk_warning);
+      for (int i = 3; (*argv)[i] != NULL; i++)
+        {
+          (*argv)[i] = (*argv)[i + 1];
+        }
+    }
 
-   return 0;
+  return 0;
 }
